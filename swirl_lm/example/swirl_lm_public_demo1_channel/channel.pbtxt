@@ -1,0 +1,106 @@
+# proto-file: swirl_lm/base/parameters.proto 
+# proto-message: SwirlLMParameters 
+ 
+solver_procedure: VARIABLE_DENSITY 
+convection_scheme: CONVECTION_SCHEME_QUICK 
+time_integration_scheme: TIME_SCHEME_CN_EXPLICIT_ITERATION 
+periodic { 
+  dim_0: false 
+  dim_1: false 
+  dim_2: true 
+} 
+pressure { 
+  solver { 
+    jacobi { 
+      max_iterations: 10 halo_width: 2 omega: 0.67 
+    } 
+  } 
+  num_d_rho_filter: 3 
+  update_p_bc_by_flow: true 
+} 
+thermodynamics { 
+  constant_density {} 
+} 
+density: 1.0 
+kinematic_viscosity: 0.01 
+boundary_conditions { 
+  name: "u" 
+  boundary_info { 
+    dim: 0 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 1.0 
+  } 
+  boundary_info { 
+    dim: 0 
+    location: 1 
+    type: BC_TYPE_NEUMANN 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 1 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+} 
+boundary_conditions { 
+  name: "v" 
+  boundary_info { 
+    dim: 0 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 0 
+    location: 1 
+    type: BC_TYPE_NEUMANN 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 1 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+} 
+boundary_conditions { 
+  name: "w" 
+  boundary_info { 
+    dim: 0 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 0 
+    location: 1 
+    type: BC_TYPE_NEUMANN 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 0 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+  boundary_info { 
+    dim: 1 
+    location: 1 
+    type: BC_TYPE_DIRICHLET 
+    value: 0.0 
+  } 
+} 
