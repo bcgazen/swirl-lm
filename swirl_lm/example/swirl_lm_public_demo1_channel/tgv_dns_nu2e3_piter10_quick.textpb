@@ -1,0 +1,10 @@
+solver_procedure: VARIABLE_DENSITY
+convection_scheme: CONVECTION_SCHEME_QUICK
+time_integration_scheme: TIME_SCHEME_CN_EXPLICIT_ITERATION
+periodic {
+  dim_0: true dim_1: true dim_2: true
+}
+num_pressure_iterations: 10
+density: 1.0
+kinematic_viscosity: 2e3
+use_sgs: false

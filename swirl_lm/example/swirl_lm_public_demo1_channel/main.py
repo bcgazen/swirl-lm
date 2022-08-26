@@ -1,5 +1,8 @@
+import functools
+import logging
 import os
 import sys
+import time
 
 from absl import app
 from absl import flags
@@ -7,6 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 
+from swirl_lm.base import initializer
+from swirl_lm.base import parameters as parameters_lib
 from swirl_lm.base import driver
 from swirl_lm.base import driver_tpu
 from swirl_lm.base import parameters
@@ -24,8 +29,23 @@ _ZONE = flags.DEFINE_string('zone', None, 'Zone.', required=True)
 _PROJECT = flags.DEFINE_string('project', None, 'Cloud project id.', 
                                required=True)
 
+_INIT_FN = flags.DEFINE_string('init_fn', None, 'Init fn.', required=True)
 _OUTPUT = flags.DEFINE_string('output', None, 'Output image filename.', 
                               required=True)
+
+flags.DEFINE_float(
+    'u_mag',
+    1.0,
+    'The magnitude of the velocity component in dim 0.',
+    allow_override=True)
+flags.DEFINE_float(
+    'p_ref',
+    0.0,
+    'The reference pressure used in pressure-induced Taylor-Green vortex.')
+flags.DEFINE_float(
+    'rho_ref',
+    1.0,
+    'The reference density used in pressure-induced Taylor-Green vortex.')
 
 
 # Defines the function that initializes state variables.
@@ -44,7 +64,192 @@ def init_fn_channel(replica_id, coordinates):
    }
 
 
-# Utility functions for postprocessing.
+def taylor_green_vortices(
+    config,
+    replica_id,
+    coordinates,
+):
+  """Initialize the u, v, w, and p field in each TPU replica.
+
+  The velocity and pressure fields are initialized following the reference:
+
+  J. R. DeBonis, Solutions of the Taylor-Green vortex problem using
+  high-resolution explicit finite difference methods, 51st AIAA Aerospace
+  Sciences Meeting including the New Horizons Forum and Aerospace Exposition,
+  2013.
+
+  Args:
+    replica_id: The ID number of the replica.
+    coordinates: A tuple that specifies the replica's grid coordinates in
+      physical space.
+
+  Returns:
+    A dictionary of states and values that are stored as string and 3D tensor
+    pairs.
+  """
+
+  v0 = FLAGS.u_mag
+  p0 = FLAGS.p_ref
+  rho0 = FLAGS.rho_ref
+
+  def get_vortices(state_key):
+    """Generates the vortex field for each flow variable."""
+
+    def get_u(
+        xx,
+        yy,
+        zz,
+        lx,
+        ly,
+        lz,
+        coord,
+    ):
+      """Generates the velocity component in dim 0.
+
+      Args:
+        xx: The sub-mesh in dimension 0 in the present replica.
+        yy: The sub-mesh in dimension 1 in the present replica.
+        zz: The sub-mesh in dimension 2 in the present replica.
+        lx: Length in dimension 0.
+        ly: Length in dimension 1.
+        lz: Length in dimension 2.
+        coord: The coordinate of the local core.
+
+      Returns:
+        The 3D velocity field in dimension 0 in the present replica.
+      """
+      del coord
+      x_corr = config.dx / (lx + config.dx) * 2.0 * np.pi
+      y_corr = config.dy / (ly + config.dy) * 2.0 * np.pi
+      z_corr = config.dz / (lz + config.dz) * 2.0 * np.pi
+      return v0 * tf.math.sin((2.0 * np.pi - x_corr) * xx / lx) * tf.math.cos(
+          (2.0 * np.pi - y_corr) * yy / ly) * tf.math.cos(
+              (2.0 * np.pi - z_corr) * zz / lz)
+
+    def get_v(
+        xx,
+        yy,
+        zz,
+        lx,
+        ly,
+        lz,
+        coord,
+    ):
+      """Generates the velocity component in dim 1.
+
+      Args:
+        xx: The sub-mesh in dimension 0 in the present replica.
+        yy: The sub-mesh in dimension 1 in the present replica.
+        zz: The sub-mesh in dimension 2 in the present replica.
+        lx: Length in dimension 0.
+        ly: Length in dimension 1.
+        lz: Length in dimension 2.
+        coord: The coordinate of the local core.
+
+      Returns:
+        The 3D velocity field in dimension 1 in the present replica.
+      """
+      del coord
+      x_corr = config.dx / (lx + config.dx) * 2.0 * np.pi
+      y_corr = config.dy / (ly + config.dy) * 2.0 * np.pi
+      z_corr = config.dz / (lz + config.dz) * 2.0 * np.pi
+      return -v0 * tf.math.cos(
+          (2.0 * np.pi - x_corr) * xx / lx) * tf.math.sin(
+              (2.0 * np.pi - y_corr) * yy / ly) * tf.math.cos(
+                  (2.0 * np.pi - z_corr) * zz / lz)
+
+    def get_w(
+        xx,
+        yy,
+        zz,
+        lx,
+        ly,
+        lz,
+        coord,
+    ):
+      """Generates the velocity component in dim 2.
+
+      Args:
+        xx: The sub-mesh in dimension 0 in the present replica.
+        yy: Not used.
+        zz: Not used.
+        lx: Not used.
+        ly: Not used.
+        lz: Not used.
+        coord: The coordinate of the local core.
+
+      Returns:
+        The 3D velocity field in dimension 2 in the present replica.
+      """
+      del yy, zz, lx, ly, lz, coord
+      return tf.zeros_like(xx, dtype=tf.float32)
+
+    def get_p(
+        xx,
+        yy,
+        zz,
+        lx,
+        ly,
+        lz,
+        coord,
+    ):
+      """Generates the pressure field.
+
+      Args:
+        xx: The sub-mesh in dimension 0 in the present replica.
+        yy: The sub-mesh in dimension 1 in the present replica.
+        zz: The sub-mesh in dimension 2 in the present replica.
+        lx: Length in dimension 0.
+        ly: Length in dimension 1.
+        lz: Length in dimension 2.
+        coord: The coordinate of the local core.
+
+      Returns:
+        The 3D pressure field in the present replica.
+      """
+      del coord
+      x_corr = config.dx / (lx + config.dx) * 2.0 * np.pi
+      y_corr = config.dy / (ly + config.dy) * 2.0 * np.pi
+      z_corr = config.dz / (lz + config.dz) * 2.0 * np.pi
+      return p0 + rho0 * v0**2 / 16.0 * (
+          (tf.math.cos(2.0 * (2.0 * np.pi - z_corr) * zz / lz) + 2.) *
+          (tf.math.cos(2.0 * (2.0 * np.pi - x_corr) * xx / lx) +
+           tf.math.cos(2.0 * (2.0 * np.pi - y_corr) * yy / ly)))
+
+    if state_key == 'u':
+      return get_u
+    elif state_key == 'v':
+      return get_v
+    elif state_key == 'w':
+      return get_w
+    elif state_key == 'p':
+      return get_p
+    else:
+      raise ValueError(
+          'State key must be one of u, v, w, p. {} is given.'.format(
+              state_key))
+
+  output = {'replica_id': replica_id}
+  _FIELDS = ('u', 'v', 'w', 'p')
+
+  for key in _FIELDS:
+    output.update({
+        key:
+            initializer.partial_mesh_for_core(
+                config,
+                coordinates,
+                get_vortices(key),
+                num_boundary_points=0)
+    })
+
+  if (config.solver_procedure ==
+      parameters_lib.SolverProcedure.VARIABLE_DENSITY):
+    output.update({'rho': tf.ones_like(output['u'], dtype=tf.float32)})
+
+  return output
+
+
+  # Utility functions for postprocessing.
 
 def merge_result(values, coordinates, halo_width):
   """Merges results from multiple TPU replicas following the topology."""
@@ -99,9 +304,17 @@ def main(unused_argv):
 
   print("All devices: ", tf.config.list_logical_devices('TPU'))
 
+  init_fn_map = {
+    'channel': init_fn_channel,
+    'hit': functools.partial(taylor_green_vortices, params)
+  }
+
+  init_fn = init_fn_map.get(_INIT_FN.value)
+  assert init_fn is not None, (
+    f'init_fn {_INIT_FN.value} not one of {init_fn_map.keys()}')
   # initializes the simulation.
   state = driver_tpu.distribute_values(
-    tpu_strategy, value_fn=init_fn_channel,
+    tpu_strategy, value_fn=init_fn,
     logical_coordinates=logical_coordinates)
 
   # Runs the simulation for one cycle.
@@ -116,12 +329,16 @@ def main(unused_argv):
 
   step_id += FLAGS.num_steps
 
+  start_time_s = time.perf_counter()
   state = driver._one_cycle(
       strategy=tpu_strategy,
       init_state=state,
       init_step_id=step_id,
       num_steps=FLAGS.num_steps,
       params=params)
+  duration_s = time.perf_counter() - start_time_s
+  logging.info('%s steps in %f secs, avg secs/step: %f',
+               FLAGS.num_steps, duration_s, duration_s / FLAGS.num_steps)
   
   varname = 'v'  # ['u', 'v', 'w', 'p', 'rho']
 
