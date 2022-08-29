@@ -1,4 +1,4 @@
-PYTHON_PACKAGES=/home/bcg/.local/lib/python3.7/site-packages
+PYTHON_PACKAGES=$(pip show swirl_lm | sed -n -e 's/Location: \(.*\)/\1/p')
 proto_names=(
     'base/parameters.proto'
     'boundary_condition/boundary_conditions.proto'
