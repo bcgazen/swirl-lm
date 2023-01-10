@@ -1,25 +1,37 @@
+# Copyright 2022 The swirl_lm Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 r"""Demo for running Taylor-Green Vortex Flow with Swirl-LM on cloud TPUs.
 
 Example command line:
 
-  python3 main.py --cx=1 --cy=1 --cz=8 \
-    --data_dump_prefix=./data/tgv --data_load_prefix=./data/tgv \
-    --config_filepath=./tgv_3d.textpb \
-    --num_steps=2000 --nx=128 --ny=128 --nz=6 --kernel_size=16 \
-    --halo_width=2 --lx=6.28 --ly=6.28 --lz=6.28 \
-    --num_boundary_points=0 --dt=2e-3 --u_mag=1.0 --p_ref=0.0 --rho_ref=1.0 \
-    --target=<tpu> --output_fn_template=tgv_{var}.png
+  python3 main.py --cx=2 --cy=2 --cz=8 \
+    --data_dump_prefix=gs://<GCS_DIR>/data/tgv \
+    --data_load_prefix=gs://<GCS_DIR>/data/tgv \
+    --config_filepath=tgv_3d.textpb \
+    --num_steps=2000 --nx=128 --ny=128 --nz=6 --kernel_size=16 --halo_width=2 \
+    --lx=6.28 --ly=6.28 --lz=6.28 --num_boundary_points=0 --dt=2e-3 \
+    --u_mag=1.0 --p_ref=0.0 --rho_ref=1.0 --target=<TPU> \
+    --output_fn_template=gs://<GCS_DIR>/output/tgv_{var}.png
 """
 import functools
-import logging
-import time
 
 from absl import app
 from absl import flags
 import matplotlib.pyplot as plt
 import numpy as np
 from swirl_lm.base import driver
-from swirl_lm.base import driver_tpu
 from swirl_lm.base import initializer
 from swirl_lm.base import parameters
 from swirl_lm.utility import tpu_util
@@ -39,10 +51,8 @@ _RHO_REF = flags.DEFINE_float(
     'rho_ref', 1.0,
     'The reference density used in pressure-induced Taylor-Green vortex.')
 _OUTPUT_FN_TEMPLATE = flags.DEFINE_string(
-    'output_fn_template',
-    None,
-    'Output image filename template, e.g., "tgv_{var}.png".',
-    required=True)
+    'output_fn_template', 'tgv_{var}.png',
+    'Output image filename template - should contain {var} as a substring.')
 
 
 def taylor_green_vortices(config, v0, p0, rho0, replica_id, coordinates):
@@ -213,7 +223,7 @@ def taylor_green_vortices(config, v0, p0, rho0, replica_id, coordinates):
                 config, coordinates, get_vortices(key), num_boundary_points=0)
     })
 
-  if (config.solver_procedure == parameters.SolverProcedure.VARIABLE_DENSITY):
+  if config.solver_procedure == parameters.SolverProcedure.VARIABLE_DENSITY:
     output.update({'rho': tf.ones_like(output['u'], dtype=tf.float32)})
 
   return output
@@ -252,7 +262,8 @@ def merge_result(values, var, coordinates, halo_width):
   return result
 
 
-def plot_var(result, lx, ly, output_fn):
+def contour_plot(result, lx, ly, output):
+  """Saves contour-plot of the middle slice of 3d data in result in output."""
   nz, ny, nx = result.shape
 
   x = np.linspace(0.0, lx, nx)
@@ -263,7 +274,7 @@ def plot_var(result, lx, ly, output_fn):
   fig.colorbar(c)
   ax.axis('equal')
 
-  with tf.io.gfile.GFile(output_fn, 'wb') as f:
+  with tf.io.gfile.GFile(output, 'wb') as f:
     fig.savefig(f)
 
 
@@ -283,8 +294,8 @@ def main(args):
   sim_vars = ['u', 'v', 'w', 'p', 'rho']
   for var in sim_vars:
     result = merge_result(state, var, logical_coordinates, FLAGS.halo_width)
-    plot_var(result, FLAGS.lx, FLAGS.ly,
-             _OUTPUT_FN_TEMPLATE.value.format(var=var))
+    contour_plot(result, FLAGS.lx, FLAGS.ly,
+                 _OUTPUT_FN_TEMPLATE.value.format(var=var))
 
 
 if __name__ == '__main__':

@@ -42,7 +42,7 @@ Cloud TPUs.
    Note: The VM and the TPU nodes have the same name. The name refers to the VM
    normally, and to the TPU cluster when used in the TPU APIs.
 
-   Note: you might need to enable the TPU API for your project if it's not
+   Note: You might need to enable the TPU API for your project if it's not
    already enabled.
 
 1. SSH into the VM:
@@ -89,20 +89,26 @@ editor:
 1. (VM) Run the solver.
 
    ```sh
-   python3 ./swirl-lm/swirl_lm/example/tgv/main.py \
-     --cx=1 --cy=1 --cz=8 \
-     --data_dump_prefix=./data/tgv --data_load_prefix=./data/tgv \
-     --config_filepath=./swirl-lm/swirl_lm/example/tgv/tgv_dns_nu2e3_piter10_quick.textpb \
-     --num_steps=2000 --nx=128 --ny=128 --nz=6 --kernel_size=16 \
-     --halo_width=2 --lx=99193.5483871 --ly=99193.5483871 --lz=99218.75 \
-     --num_boundary_points=0 --dt=0.1 --u_mag=1.0 --p_ref=0.0 --rho_ref=1.0 \
-     --project=<PROJECT> --tpu=<TPU> --zone=<ZONE> --output=./test.png
+    python3 swirl-lm/swirl_lm/example/tgv/main.py \
+      --data_dump_prefix=gs://<GCS_DIR>/data/tgv \
+      --data_load_prefix=gs://<GCS_DIR>/data/tgv \
+      --config_filepath=swirl-lm/swirl_lm/example/tgv/tgv_3d.textpb \
+      --cx=2 --cy=2 --cz=8 \
+      --num_steps=2000 --nx=128 --ny=128 --nz=6 --kernel_size=16 \
+      --halo_width=2 --lx=6.28 --ly=6.28 --lz=6.28 --num_boundary_points=0 \
+      --dt=2e-3 --u_mag=1.0 --p_ref=0.0 --rho_ref=1.0
+      --target=<TPU> \
+      --output_fn_template=tgv_{var}.png
    ```
+
+   Note: `<GCS_DIR>` should be a path to a folder in an existing GCS
+   bucket. It's OK if the folder doesn't yet exist - the solver will create
+   it. But the bucket should exist before the solver runs.
 
 1. (VM) Check that the output file has been created.
 
    ```sh
-   ls -l test.png
+   ls -l tgv_*.png
    ```
 
    Run the remaining commands are on your local machine and not on the VM.
@@ -110,8 +116,11 @@ editor:
 1. Copy the output out of the VM to view it locally.
 
    ```sh
-   gcloud compute scp --zone=$ZONE $TPU:test.png /tmp
+   gcloud compute scp --zone=$ZONE $TPU:tgv_*.png /tmp
    ```
+
+   Note: Alternatively, you can set `--output_fn_template` to point to a
+   location in a GCS bucket and access the files through the GCS browser.
 
 1. Delete the TPU nodes and VM.
 
@@ -121,6 +130,6 @@ editor:
 
    Note: This deletes both the TPUs and the VM. Deleting the VM also deletes
    its disk by default, so you will lose the cloned repo, etc. If you plan to
-   re-run, you can delete only the TPUs by passing `--tpu-only``` to the
+   re-run, you can delete only the TPUs by passing `--tpu-only` to the
    command above; and later create only the TPUs by again passing the same
    flag.
