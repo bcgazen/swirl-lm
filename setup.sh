@@ -23,7 +23,8 @@ function run_protoc() (
 )
 
 function install_swirl_lm() {
-  python3 -m pip install --force-reinstall .
+  python3 -m pip uninstall -y swirl-lm
+  python3 -m pip install .
 }
 
 cd $(dirname "$0")
