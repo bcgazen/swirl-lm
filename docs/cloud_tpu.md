@@ -36,8 +36,7 @@ machine running the browser to Jupyter.
     For an explanation of how TPU_FLAGS works see the section
     [Setting libtpu.so flags on pod TPUs.](#pod-tpu-flag)
 
-<pre>
-    <textarea rows="10" cols="100">
+    ```shell
     PROJECT=<YOUR_PROJECT_ID>
     ZONE=europe-west4-a
     TYPE=v3-32
@@ -47,8 +46,7 @@ machine running the browser to Jupyter.
     gcloud compute tpus tpu-vm create $TPU --project=$PROJECT --zone=$ZONE \
     --accelerator-type=$TYPE --version=tpu-vm-tf-2.11.0-pod \
     --metadata="tensorflow-env-vars=-e LIBTPU_INIT_ARGS=$TPU_FLAGS"
-    </textarea>
-</pre>
+    ```shell
 
     Same example using the Cloud console:
 
