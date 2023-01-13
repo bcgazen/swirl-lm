@@ -1,6 +1,5 @@
 # Using Cloud TPUs
 
-[TOC]
 
 ## Setting up Colab with a TPU Pod backend
 
@@ -22,35 +21,35 @@ machine running the browser to Jupyter.
 
 
 1.  Using a machine where you have installed `gcloud`, create the TPU pod. The
-    example below creates a pod of 4 TPUv3 hosts for a total of 32
-    TPUs. You can also use
-    [the cloud console](https://console.cloud.google.com/compute/tpus)
-    for this step and for figuring out what TPU topologies are available for
-    your project.
+    example below creates a pod of 4 TPUv3 hosts for a total of 32 TPUs.
+    You can also use
+    [the cloud console](https://console.cloud.google.com/compute/tpus) for this
+    step and for figuring out what TPU topologies are available for your
+    project.
 
     NOTE: The example below sets `--xla_jf_conv_full_precision` to true which
     forces TPU operations (convolutions and dot products) to use the highest
     float precision. To use low precision floats replace the `TPU_FLAGS` line
-    below with `TPU_FLAGS=--xla_jf_conv_full_precision=false`. 
+    below with `TPU_FLAGS=--xla_jf_conv_full_precision=false`.
 
     For an explanation of how TPU_FLAGS works see the section
-    [Setting libtpu.so flags on pod TPUs.](#pod-tpu-flag)
+    [Setting libtpu.so flags on pod TPUs.](#setting-libtpuso-flags-on-pod-tpus)
 
     ```shell
     PROJECT=<YOUR_PROJECT_ID>
+    TPU=<A_UNIQUE_TPU_VM_NAME>
     ZONE=europe-west4-a
     TYPE=v3-32
-    TPU=<A_UNIQUE_TPU_VM_NAME>
     TPU_FLAGS=--xla_jf_conv_full_precision=true
 
     gcloud compute tpus tpu-vm create $TPU --project=$PROJECT --zone=$ZONE \
     --accelerator-type=$TYPE --version=tpu-vm-tf-2.11.0-pod \
     --metadata="tensorflow-env-vars=-e LIBTPU_INIT_ARGS=$TPU_FLAGS"
-    ```shell
+    ```
 
     Same example using the Cloud console:
 
-    ![Cloud console](cloud_tpu/cloud_console.png){style="display:block;margin:auto"}
+    ![Cloud console](cloud_tpu/cloud_console.png)
 
 1.  ssh to a VM in the pod and tunnel port 8888. By default this command
     connects to the first worker.
@@ -116,7 +115,7 @@ TensorFlow has a workaround for this issue. The code that loads *libtpu.so* uses
 the value of the environment variable LIBTPU_INIT_ARGS to initialize the flags
 defined *libtpu.so*.
 
-    
+
 ### Setting libtpu.so flags on non-pod TPUs
 
 When you run a TensorFlow binary on non-pod TPUs (e.g., <=8 TPUv3 TPUs),
@@ -139,7 +138,7 @@ In this configuration, the main process does not load *libtpu.so*, but
 *tpu-runtime* does, since it is *tpu-runtime* that interacts with the TPU
 hardware.
 
-![tpu-runtime and libtpu.so in pod](cloud_tpu/libtpu_in_pod.png){style="display:block;margin:auto"}
+![tpu-runtime and libtpu.so in pod](cloud_tpu/libtpu_in_pod.png)
 
 Because it is now *tpu-runtime* that loads *libtpu.so*, it is also *tpu-runtime*
 that reads the environment variable LIBTPU_INIT_ARGS to initialize *libtpu.so*'s
@@ -156,7 +155,7 @@ machine's metadata configuration, and sets environment variables for
 *tpu-runtime*.
 
 
-### Setting libtpu.so flags on pod TPUs {#pod-tpu-flag}
+### Setting libtpu.so flags on pod TPUs
 
 You can set `tensorflow-env-vars` as a metadata variable while creating the TPU
 pod. For example, to set xla_jf_conv_full_precision to true:
