@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from absl import flags
 import numpy as np
+from swirl_lm.utility import common_ops
 from swirl_lm.utility import grid_parametrization_pb2
 import tensorflow as tf
 
@@ -63,7 +64,7 @@ flags.DEFINE_integer(
     allow_override=True)
 flags.DEFINE_integer(
     'num_boundary_points',
-    1,
+    0,
     'Number of points to be added to each end of the computational domain.',
     allow_override=True)
 
@@ -103,7 +104,7 @@ def _get_full_grid(n: Optional[int], l: float) -> tf.Tensor:
   return tf.linspace(0.0, l, n_effective)
 
 
-def _get_pysical_full_grid_size(
+def _get_physical_full_grid_size(
     params: grid_parametrization_pb2.GridParametrization
 ) -> grid_parametrization_pb2.CoordinateInt:
   # Some simulations have a physical grid size mandated externally, and add
@@ -142,7 +143,9 @@ def params_from_flags() -> grid_parametrization_pb2.GridParametrization:
   params.num_output_splits = FLAGS.num_output_splits
   params.num_boundary_points = FLAGS.num_boundary_points
   if not params.HasField('physical_full_grid_size'):
-    params.physical_full_grid_size.CopyFrom(_get_pysical_full_grid_size(params))
+    params.physical_full_grid_size.CopyFrom(
+        _get_physical_full_grid_size(params)
+    )
   return params
 
 
@@ -159,7 +162,9 @@ def params_from_text_proto(
                         grid_parametrization_pb2.GridParametrization()))
   # Re-compute physical_full_grid_size if necessary.
   if not params.HasField('physical_full_grid_size'):
-    params.physical_full_grid_size.CopyFrom(_get_pysical_full_grid_size(params))
+    params.physical_full_grid_size.CopyFrom(
+        _get_physical_full_grid_size(params)
+    )
   return params
 
 
@@ -182,6 +187,7 @@ class GridParametrization(object):
       params = params_from_flags()
     if params.halo_width <= 0:
       raise ValueError('Halo width must be greater than 0.')
+    self.grid_params_proto = params
     self.cx = params.computation_shape.dim_0
     self.cy = params.computation_shape.dim_1
     self.cz = params.computation_shape.dim_2
@@ -370,6 +376,121 @@ class GridParametrization(object):
   def z(self) -> tf.Tensor:
     """The full grid in dim 2."""
     return _get_full_grid(self.fz, self.lz)
+
+  def _grid_local(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+      dim: int,
+      include_halo: bool = True,
+  ) -> tf.Tensor:
+    """The local grid in `dim`.
+
+    Args:
+      replica_id: The index of the current replica.
+      replicas: A 3D tensor that saves the topology of the partitioning.
+      dim: The dimension of the grid.
+      include_halo: An option of whether to include coordinates of halos in the
+        returned grid.
+
+    Returns:
+      The grid in dim `dim` local to `replica_id`.
+
+    Raises:
+      AssertionError: If the full grid includes additional boundary points, in
+        which case the full grid can not be evenly distributed across all cores
+        without halo.
+    """
+    assert self.num_boundary_points == 0, (
+        f'Full grid can not be evenly distributed in dim {dim} because'
+        f' {self.num_boundary_points} boundary points are included.'
+    )
+
+    grid_full = (self.x, self.y, self.z)[dim]
+    n_local = (self.core_nx, self.core_ny, self.core_nz)[dim]
+    i_core = common_ops.get_core_coordinate(replicas, replica_id)[dim]
+
+    if include_halo:
+      # Assumes uniform grid spacing inside halos, which equals the grid spacing
+      # on the corresponding end.
+      # Note that tf.linspace is used here instead of tf.range. This is because
+      # tf.range requires static input, but the input, core_id, is run time
+      # determined.
+      grid_lo = (
+          tf.cast(
+              tf.linspace(-self.halo_width, -1, self.halo_width),
+              grid_full.dtype,
+          )
+          * (grid_full[1] - grid_full[0])
+          + grid_full[0]
+      )
+      grid_hi = (
+          tf.cast(
+              tf.linspace(1, self.halo_width, self.halo_width), grid_full.dtype
+          )
+          * (grid_full[-1] - grid_full[-2])
+          + grid_full[-1]
+      )
+      grid_full = tf.concat([grid_lo, grid_full, grid_hi], axis=0)
+      halo_multiplier = tf.constant(1, dtype=i_core.dtype)
+    else:
+      halo_multiplier = tf.constant(0, dtype=i_core.dtype)
+
+    indices = tf.cast(tf.linspace(
+        i_core * n_local,
+        (i_core + 1) * n_local + 2 * halo_multiplier * self.halo_width - 1,
+        n_local + 2 * halo_multiplier * self.halo_width,
+    ), dtype=tf.int32)
+
+    return tf.gather(grid_full, indices)
+
+  def x_local(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 0 without halo."""
+    return self._grid_local(replica_id, replicas, 0, False)
+
+  def y_local(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 1 without halo."""
+    return self._grid_local(replica_id, replicas, 1, False)
+
+  def z_local(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 2 without halo."""
+    return self._grid_local(replica_id, replicas, 2, False)
+
+  def x_local_ext(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 0 with halo."""
+    return self._grid_local(replica_id, replicas, 0, True)
+
+  def y_local_ext(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 1 with halo."""
+    return self._grid_local(replica_id, replicas, 1, True)
+
+  def z_local_ext(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> tf.Tensor:
+    """The local grid in dim 2 with halo."""
+    return self._grid_local(replica_id, replicas, 2, True)
 
   @property
   def input_chunks(self) -> List[Tuple[int, int]]:

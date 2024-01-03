@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # coding=utf-8
 """A library of functions that generates initial conditions for simulations.
 
-This library provides `inif_fn` that are possibly shared by different
+This library provides `init_fn` that are possibly shared by different
 simulations. The returned value of these functions provides a dictionary whose
 keys are the names variables to be initialized, and values are the `init_fn` of
 that variable.
@@ -98,8 +98,12 @@ def normal_distribution_init_fn(
     else:
       mean_val = tf.ones_like(zz, dtype=zz.dtype) * mean
 
-    return tf.random.normal(
-        mean_val.shape, stddev=std, dtype=mean_val.dtype, seed=seed) + mean_val
+    return (
+        tf.random.normal(
+            tf.shape(mean_val), stddev=std, dtype=mean_val.dtype, seed=seed
+        )
+        + mean_val
+    )
 
   return init_fn
 
@@ -341,11 +345,11 @@ def logarithmic_boundary_layer(
     return u_ref * kappa / tf.math.log(
         tf.maximum(lz - elevation, zero) / z_0)
 
-  def log_wind_profile(z: tf.Tensor, u_s: tf.Tensor, dz: float) -> tf.Tensor:
+  def log_wind_profile(z: tf.Tensor, u_s: tf.Tensor, dz: tf.Tensor
+                       ) -> tf.Tensor:
     """Generates the log-wind profile as a function of height."""
-    dz = tf.constant(dz, dtype=_TF_DTYPE)
 
-    # Round elevation down to it's nearest integer multiple of dz to account for
+    # Round elevation down to its nearest integer multiple of dz to account for
     # the mesh resolution.
     elevation_corrected = (elevation // dz) * dz
 
@@ -370,8 +374,7 @@ def logarithmic_boundary_layer(
 
     u_s = friction_velocity(u_inf, lz)
 
-    _, _, nz = zz.get_shape().as_list()
-    dz = lz / float(nz - 1)
+    dz = zz[0, 0, 1] - zz[0, 0, 0]
 
     return log_wind_profile(zz, u_s, dz)
 
@@ -389,8 +392,7 @@ def logarithmic_boundary_layer(
 
     u_s = friction_velocity(v_inf, lz)
 
-    _, _, nz = zz.get_shape().as_list()
-    dz = lz / float(nz - 1)
+    dz = zz[0, 0, 1] - zz[0, 0, 0]
 
     return log_wind_profile(zz, u_s, dz)
 

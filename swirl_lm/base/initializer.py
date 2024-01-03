@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,12 @@ import enum
 from typing import Callable, List, Optional, Sequence, Text, Tuple, Union
 
 import numpy as np
-from swirl_lm.utility import common_ops
 from swirl_lm.utility import grid_parametrization
 from swirl_lm.utility import types
 import tensorflow as tf
 
 TensorOrArray = Union[tf.Tensor, np.ndarray]
-ThreeIntTuple = Tuple[int, int, int]
+ThreeIntTuple = Union[np.ndarray, tf.Tensor, Tuple[int, int, int]]
 ValueFunction = Callable[[
     TensorOrArray, TensorOrArray, TensorOrArray, float, float, float,
     ThreeIntTuple
@@ -59,7 +58,7 @@ def partial_mesh_for_core(
   as arguments. It returns a partial mesh with the corresponding values for the
   core at the coordinate specified by `coordinate`.
 
-  NB: `perm` and `pad_mode` have defaults if the paremeters are not provided.
+  NB: `perm` and `pad_mode` have defaults if the parameters are not provided.
   This is in contrast to passing the value `None`, which means, `do not
   transpose` and `do not pad`, respectively.
 
@@ -144,18 +143,37 @@ def partial_mesh_for_core(
   gx = coordinate[0]
   gy = coordinate[1]
   gz = coordinate[2]
-  if not 0 <= gx < cx or not 0 <= gy < cy or not 0 <= gz < cz:
-    raise ValueError('invalid subgrid coordinate specified. Subgrid {} '
-                     'specified while compute shape is ({}, {}, {})'.format(
-                         coordinate, cx, cy, cz))
+  # These assert ops will be ignored on TPU. Force to place on CPU in case the
+  # function is used outside initialization stage (which is already on CPU).
+  with tf.device('CPU'):
+    tf.debugging.assert_greater_equal(
+        gx, 0,
+        'Invalid subgrid coordinate specified with negative x core index.')
+    tf.debugging.assert_greater(
+        cx, gx,
+        'Invalid subgrid coordinate specified with x core index. Must be '
+        'smaller than total number of core partitioning in x direction.')
+    tf.debugging.assert_greater_equal(
+        gy, 0, 'Invalid subgrid coordinate specified with negative y core '
+        'index.')
+    tf.debugging.assert_greater(
+        cy, gy,
+        'Invalid subgrid coordinate specified with y core index. Must be '
+        'smaller than total number of core partitioning in y direction.')
+    tf.debugging.assert_greater_equal(
+        gz, 0,
+        'Invalid subgrid coordinate specified with negative z core index.')
+    tf.debugging.assert_greater(
+        cz, gz,
+        'Invalid subgrid coordinate specified with z core index. Must be '
+        'smaller than total number of core partitioning in z direction.')
 
   xs = get_slice_in_dim(core_nx, lx, cx, gx, params.x)
   ys = get_slice_in_dim(core_ny, ly, cy, gy, params.y)
   zs = get_slice_in_dim(core_nz, lz, cz, gz, params.z)
 
-  # tf.meshgrid is memory inefficient, so we use our own implementation.
-  xx, yy, zz = common_ops.meshgrid(xs, ys, zs)
-  val = value_fn(xx, yy, zz, _NP_DTYPE(lx), _NP_DTYPE(ly), _NP_DTYPE(lz),
+  xx, yy, zz = tf.meshgrid(xs, ys, zs, indexing='ij')
+  val = value_fn(xx, yy, zz, _NP_DTYPE(lx), _NP_DTYPE(ly), _NP_DTYPE(lz),  # pytype: disable=wrong-arg-types  # numpy-scalars
                  coordinate)
   if pad_mode:
     val = tf.pad(
@@ -252,9 +270,20 @@ def gen_forcing(params, coordinate, alpha_max=0.05, perm=DEFAULT_PERMUTATION):
   return partial_mesh_for_core(params, coordinate, gen_forcing_fn, perm)
 
 
-def subgrid_slice(subgrid_size: int,
-                  coordinate: int,
-                  halo_width: Optional[int] = 1) -> slice:
+def subgrid_slice_indices(
+    subgrid_size: int,
+    coordinate: int,
+    halo_width: int = 1,
+) -> Tuple[int, int]:
+  """Determines the start and end indices for slicing."""
+  core_subgrid_size = subgrid_size - 2 * halo_width
+  start = coordinate * core_subgrid_size
+  return start, start + subgrid_size
+
+
+def subgrid_slice(
+    subgrid_size: int, coordinate: int, halo_width: Optional[int] = 1
+) -> slice:
   """Returns the slice of a field corresponding to `coordinate`.
 
   Args:
@@ -266,9 +295,9 @@ def subgrid_slice(subgrid_size: int,
     The subgrid slice corresponding to the given subgrid coordinate (including
     halo).
   """
-  core_subgrid_size = subgrid_size - 2 * halo_width
-  start = coordinate * core_subgrid_size
-  return slice(start, start + subgrid_size)
+  start, end = subgrid_slice_indices(subgrid_size, coordinate, halo_width)
+
+  return slice(start, end)
 
 
 def three_d_subgrid_slices(
@@ -294,7 +323,7 @@ def three_d_subgrid_slices(
 def subgrid_of_3d_grid(
     full_3d_grid: Union[TensorOrArray, List[TensorOrArray]],
     subgrid_size: ThreeIntTuple,
-    coordinates: Union[np.ndarray, ThreeIntTuple],
+    coordinates: ThreeIntTuple,
     halo_width: Optional[int] = 1) -> Union[TensorOrArray, List[TensorOrArray]]:
   """Returns the subgrid of `full_3d_grid` corresponding to `coordinates`.
 
@@ -338,7 +367,7 @@ def subgrid_of_3d_grid_from_params(
 
 def subgrid_of_3d_tensor(full_3d_grid: tf.Tensor,
                          subgrid_shape: Sequence[int],
-                         coordinates: Union[np.ndarray, tf.Tensor],
+                         coordinates: ThreeIntTuple,
                          halo_width: Optional[int] = 1) -> tf.Tensor:
   """Similar to `subgrid_of_3d_grid`, but for a tensor."""
   core_subgrid_shape = np.array([s - 2 * halo_width for s in subgrid_shape])
@@ -380,7 +409,7 @@ def subgrid_of_2d_grid(full_2d_grid: TensorOrArray,
 def three_d_subgrid_of_2d_grid(
     full_2d_grid: TensorOrArray,
     params: grid_parametrization.GridParametrization,
-    coordinates: Tuple[int, int, int]) -> TensorOrArray:
+    coordinates: ThreeIntTuple) -> TensorOrArray:
   """Same as `subgrid_of_2d_grid`, but with an added trivial third dimension."""
   sub_grid = subgrid_of_2d_grid(full_2d_grid, params, coordinates)
   expand_dims = (

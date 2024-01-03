@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/445670579.svg)](https://zenodo.org/badge/latestdoi/445670579)
 # Swirl-LM: Computational Fluid Dynamics in TensorFlow
 *This is not an official Google product*
 
@@ -7,9 +8,24 @@ variable-density Navier-Stokes equation using a low-Mach approximation, and the
 governing equations are discretized by a finite-difference method on a
 collocated structured mesh. It is implemented in TensorFlow.
 
+## Installation
+
+To use Swirl-LM, you will need access to
+[TPUs on Google Cloud](https://cloud.google.com/tpu/docs/tpus).
+For small simulations, the easiest way to access TPUs is to use Google Colab. To
+see a demo, you can open one of
+[the example notebooks](swirl_lm/example)
+and follow the notebook's instructions.
+
+To run large simulations, you will need to create TPU Nodes or VMs in your
+Google Cloud project. See [the
+instructions](swirl_lm/example/tgv)
+for the stand-alone demo on how to set up TPU Nodes and [the docs about Cloud
+TPUs](docs/cloud_tpu.md) to set up TPM VMs.
+
 ## Citation
 
-If you extend or use this package in your work (except the compoenents in the
+If you extend or use this package in your work (except the components in the
 `ext`  subpackage, in which case please reference the information within that
 subpackage), please cite the
 [paper](https://www.sciencedirect.com/science/article/abs/pii/S0010465522000108)

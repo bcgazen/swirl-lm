@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
      MONITOR_pressure_convergence_l-1: This records the L1 norm of the residual
        at the end of the step.
-     MONITOR_pressure_convergence_l-2: This records the L1 norm of the residual
+     MONITOR_pressure_convergence_l-2: This records the L2 norm of the residual
        at the end of the step.
      MONITOR_pressure_convergence_l-inf: This records the L-inf norm of the
        residual at the end of the step.
@@ -139,6 +139,7 @@ from swirl_lm.numerics import filters
 from swirl_lm.physics.thermodynamics import thermodynamics_manager
 from swirl_lm.physics.thermodynamics import thermodynamics_pb2
 from swirl_lm.utility import common_ops
+from swirl_lm.utility import debug_print
 from swirl_lm.utility import get_kernel_fn
 from swirl_lm.utility import monitor
 from swirl_lm.utility import types
@@ -146,11 +147,9 @@ import tensorflow as tf
 
 from google.protobuf import text_format
 
+
 FlowFieldVal = types.FlowFieldVal
 FlowFieldMap = types.FlowFieldMap
-
-# The gravitational acceleration constant, in units of N/kg.
-_GRAVITY = 9.81
 
 _G_THRESHOLD = 1e-6
 
@@ -161,6 +160,8 @@ _POISSON_SOLVER_INTERNAL_DTYPE = None
 _TF_DTYPE = types.TF_DTYPE
 
 _NormType = common_ops.NormType
+
+_DEBUG_PRINT_LOG_LEVEL = debug_print.LogLevel.INFO
 
 
 def _monitor_key(
@@ -254,7 +255,7 @@ def _gen_monitor_data(
     states: FlowFieldMap,
     input_monitor_params: Mapping[Text, Any],
     halo_width: int,
-) -> Mapping[Text, tf.Tensor]:
+) -> monitor.MonitorDataType:
   """Generates monitoring data.
 
   Args:
@@ -472,11 +473,11 @@ class Pressure(object):
       self,
       replica_id: tf.Tensor,
       replicas: np.ndarray,
-      states,
+      states: FlowFieldMap,
+      additional_states: FlowFieldMap,
       rho_info: DensityInfo,
       subiter: tf.Tensor = None,
   ) -> Tuple[FlowFieldVal, monitor.MonitorDataType]:  # pytype: disable=annotation-type-mismatch
-    # pylint: disable=line-too-long
     """Updates the pressure correction.
 
     This method follows the approach introduced in:
@@ -496,9 +497,11 @@ class Pressure(object):
     Args:
       replica_id: The ID number of the replica.
       replicas: A numpy array that maps a replica's grid coordinate to its
-        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
       states: A dictionary that holds flow field variables from the latest
         prediction.
+      additional_states: A dictionary that holds helper variables required by
+        the Poisson solver.
       rho_info: The density information required the pressure solver. For
         constant density, `rho_info` is an instance of `ConstantDensityInfo`
         which contains the value of the density as a float. For variable
@@ -561,35 +564,32 @@ class Pressure(object):
         # Compute velocity gradient based on interpolated values on cell faces.
         coeff_x = dt / (4. * coeff_rho * dx**2)
         du = self._kernel_op.apply_kernel_op_x(momentum_x, 'kDx')
-        du_dx = [
-            du_i / (2. * dx) + coeff_x * d4p_dx4_i
-            for du_i, d4p_dx4_i in zip(du, d4p_dx4)
-        ]
+        du_dx = tf.nest.map_structure(
+            lambda du_i, d4p_dx4_i: du_i / (2. * dx) + coeff_x * d4p_dx4_i,
+            du, d4p_dx4)
 
         coeff_y = dt / (4. * coeff_rho * dy**2)
         dv = self._kernel_op.apply_kernel_op_y(momentum_y, 'kDy')
-        dv_dy = [
-            dv_i / (2. * dy) + coeff_y * d4p_dy4_i
-            for dv_i, d4p_dy4_i in zip(dv, d4p_dy4)
-        ]
+
+        dv_dy = tf.nest.map_structure(
+            lambda dv_i, d4p_dy4_i: dv_i / (2. * dy) + coeff_y * d4p_dy4_i,
+            dv, d4p_dy4)
 
         coeff_z = dt / (4. * coeff_rho * dz**2)
         dw = self._kernel_op.apply_kernel_op_z(momentum_z, 'kDz', 'kDzsh')
-        dw_dz = [
-            dw_i / (2. * dz) + coeff_z * d4p_dz4_i
-            for dw_i, d4p_dz4_i in zip(dw, d4p_dz4)
-        ]
+        dw_dz = tf.nest.map_structure(
+            lambda dw_i, d4p_dz4_i: dw_i / (2. * dz) + coeff_z * d4p_dz4_i,
+            dw, d4p_dz4)
 
-        return [
-            du_dx_i + dv_dy_i + dw_dz_i
-            for du_dx_i, dv_dy_i, dw_dz_i in zip(du_dx, dv_dy, dw_dz)
-        ]
+        return tf.nest.map_structure(
+            lambda du_dx_i, dv_dy_i, dw_dz_i: du_dx_i + dv_dy_i + dw_dz_i,
+            du_dx, dv_dy, dw_dz)
 
       def add_factor(
           v,
           factor,
       ):
-        return [factor * v_i for v_i in v]
+        return tf.nest.map_structure(lambda v_i: factor * v_i, v)
 
       b_terms = {
           _B_TERM_SOURCE_RHO: add_factor(src_rho, inv_dt),
@@ -600,9 +600,7 @@ class Pressure(object):
                 add_factor(
                     div(rho_info.rho, states['u'], states['v'], states['w']),
                     inv_dt * rho_info.rho),
-            _B_TERM_DRHO_DT: [
-                tf.zeros_like(src_rho_i) for src_rho_i in src_rho
-            ],
+            _B_TERM_DRHO_DT: tf.nest.map_structure(tf.zeros_like, src_rho),
         })
 
       elif isinstance(rho_info, VariableDensityInfo):
@@ -616,17 +614,24 @@ class Pressure(object):
         })
 
       else:
-        raise ValueError('`rho_info` has to be either `ConstantDensityInfo` or '
-                         '`VariableDensityInfo`.')
+        raise ValueError(
+            '`rho_info` has to be either `ConstantDensityInfo` or '
+            f'`VariableDensityInfo`, but {rho_info} is provided.'
+        )
 
-      # pylint: disable=g-complex-comprehension
-      return [(div_i + drho_dt_i - src_rho_i)
-              for div_i, drho_dt_i, src_rho_i in zip(
-                  b_terms[_B_TERM_DIV],
-                  b_terms[_B_TERM_DRHO_DT],
-                  b_terms[_B_TERM_SOURCE_RHO],
-              )], b_terms
-      # pylint: enable=g-complex-comprehension
+      # pylint: disable=g-long-lambda
+      return (
+          tf.nest.map_structure(
+              lambda div_i, drho_dt_i, src_rho_i: (
+                  div_i + drho_dt_i - src_rho_i
+              ),
+              b_terms[_B_TERM_DIV],
+              b_terms[_B_TERM_DRHO_DT],
+              b_terms[_B_TERM_SOURCE_RHO],
+          ),
+          b_terms,
+      )
+      # pylint: enable=g-long-lambda
 
     def dp_exchange_halos(dpr,):
       """Updates halos and applies the homogeneoues boundary condition."""
@@ -651,35 +656,25 @@ class Pressure(object):
 
       return exchange_halos(dpr, bc_dp)
 
-    src_rho = self._source['rho'] if self._source['rho'] is not None else [
-        tf.zeros_like(p_i, dtype=p_i.dtype) for p_i in states['p']
-    ]
+    src_rho = self._source['rho'] if self._source['rho'] is not None else (
+        tf.nest.map_structure(tf.zeros_like, states['p']))
 
     # Mean removal is only applied when no Dirichlet boundary conditions are
     # specified, in which case there will be infinite number of solutions.
-    mean_removal = True
-    for dim in range(3):
-      if self._params.periodic_dims[dim]:
-        continue
-
-      for face in range(2):
-        if self._bc['p'][dim][face][0] == halo_exchange.BCType.DIRICHLET:
-          mean_removal = False
-          break
-      else:
-        continue
-
-      break
+    has_dirichlet_bc = any(
+        not self._params.periodic_dims[dim] and  # pylint: disable=g-complex-comprehension
+        self._bc['p'][dim][face][0] == halo_exchange.BCType.DIRICHLET
+        for dim in range(3) for face in range(2))
+    mean_removal = not has_dirichlet_bc
 
     b, monitor_params = build_rhs()
 
-    dp0 = [tf.zeros_like(b_i) for b_i in b]
+    dp0 = tf.nest.map_structure(tf.zeros_like, b)
 
+    helper_vars = dict(additional_states)
     if (self._thermodynamics.solver_mode ==
         thermodynamics_pb2.Thermodynamics.ANELASTIC):
-      helper_vars = {poisson_solver.VARIABLE_COEFF: states['rho']}
-    else:
-      helper_vars = None
+      helper_vars[poisson_solver.VARIABLE_COEFF] = states['rho']
 
     # Note that the solution that is denoted as `dp` from the Poisson solver has
     # different meanings under different modes of thermodynamics. In the low
@@ -693,11 +688,41 @@ class Pressure(object):
         dp_exchange_halos,
         internal_dtype=_POISSON_SOLVER_INTERNAL_DTYPE,
         additional_states=helper_vars)
+
     dp = poisson_solution[poisson_solver.X]
 
     dp = common_ops.remove_global_mean(
         common_ops.tf_cast(dp, _TF_DTYPE), replicas,
         halo_width) if mean_removal else common_ops.tf_cast(dp, _TF_DTYPE)
+
+    # Debug print is guarded behind the flag so the default (not enabled)
+    # is a no-op where the computational graph is not changed.
+    if debug_print.log_enabled(_DEBUG_PRINT_LOG_LEVEL):
+      norm_types = (_NormType.L1, _NormType.L2, _NormType.L_INF)
+      norms, residual_raw = self._solver.compute_residual(
+          replica_id=replica_id,
+          replicas=replicas,
+          f=dp,
+          rhs=b,
+          norm_types=norm_types,
+          halo_width=halo_width,
+          halo_update_fn=dp_exchange_halos,
+          remove_mean_from_rhs=False,
+          internal_dtype=_POISSON_SOLVER_INTERNAL_DTYPE,
+      )
+      debug_print.log_mean_min_max(
+          common_ops.strip_halos(residual_raw, [halo_width] * 3),
+          replica_id=replica_id,
+          message='Pressure solver local residual: ',
+          log_level=_DEBUG_PRINT_LOG_LEVEL,
+      )
+      for i, norm_type in enumerate(norm_types):
+        debug_print.log_mean_min_max(
+            norms[i],
+            replica_id=replica_id,
+            message=f'Pressure solver global residual {norm_type} norm: ',
+            log_level=_DEBUG_PRINT_LOG_LEVEL,
+        )
 
     if (self._thermodynamics.solver_mode ==
         thermodynamics_pb2.Thermodynamics.ANELASTIC):
@@ -820,7 +845,8 @@ class Pressure(object):
             # layer by assigning values to the pressure in halos adjacent to the
             # fluid domain.
             rho_0 = self._thermodynamics.rho_ref(
-                additional_states.get('zz', None))
+                additional_states.get('zz', None), additional_states
+            )
             b = eq_utils.buoyancy_source(self._kernel_op, states['rho_thermal'],
                                          rho_0, self._params, i)
 
@@ -927,8 +953,7 @@ class Pressure(object):
     Returns:
       A dictionary with the updated pressure and pressure corrector.
     """
-    del additional_states
-
+    drho_dt = tf.nest.map_structure(tf.zeros_like, states['rho'])
     if (self._thermodynamics.solver_mode ==
         thermodynamics_pb2.Thermodynamics.LOW_MACH):
       exchange_halos = functools.partial(
@@ -937,15 +962,18 @@ class Pressure(object):
           replica_id=replica_id,
           replicas=replicas)
 
-      # pylint: disable=g-complex-comprehension
-      drho_0 = [
-          tf.compat.v1.where(
-              tf.abs(drho_i) <
-              self._pressure_params.d_rho_rtol * tf.abs(rho0_i),
-              tf.zeros_like(drho_i), drho_i)
-          for drho_i, rho0_i in zip(states['drho'], states_0['rho'])
-      ]
-      # pylint: enable=g-complex-comprehension
+      # pylint: disable=g-long-lambda
+      drho_0 = tf.nest.map_structure(
+          lambda drho_i, rho0_i: tf.where(
+              tf.abs(drho_i)
+              < self._pressure_params.d_rho_rtol * tf.abs(rho0_i),
+              tf.zeros_like(drho_i),
+              drho_i,
+          ),
+          states['drho'],
+          states_0['rho'],
+      )
+      # pylint: enable=g-long-lambda
 
       drho_filter_cond = lambda i, drho_i: i < self._n_filter
 
@@ -964,16 +992,17 @@ class Pressure(object):
           loop_vars=(i0, drho_0),
           back_prop=False)
 
-      drho_dt = [drho_i / self._params.dt for drho_i in drho]
+      drho_dt = tf.nest.map_structure(lambda drho_i: drho_i / self._params.dt,
+                                      drho)
     elif (self._thermodynamics.solver_mode ==
           thermodynamics_pb2.Thermodynamics.ANELASTIC):
-      drho_dt = [tf.zeros_like(rho_i) for rho_i in states['rho']]
+      drho_dt = tf.nest.map_structure(tf.zeros_like, states['rho'])
 
     rho_info = VariableDensityInfo(drho_dt)
 
-    dp, monitor_vars = self._pressure_corrector_update(replica_id, replicas,
-                                                       states, rho_info,
-                                                       subiter)
+    dp, monitor_vars = self._pressure_corrector_update(
+        replica_id, replicas, states, additional_states, rho_info, subiter
+    )
 
     states_updated = {
         'p': tf.nest.map_structure(lambda p_, dp_: p_ + dp_, states['p'], dp),

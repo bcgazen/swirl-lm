@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ def outflow_boundary_condition() -> StatesUpdateFn:
   the variable density solver where `rho` is in `states`.
 
   Returns:
-    A function that updates the Dirichelt boundary condition for required
+    A function that updates the Dirichlet boundary condition for required
     variables in dimension 0 on face 1, i.e. all `additional_states` with key
     regular expression 'bc_(\w+)_0_1', with `\w+` being the variable name.
   """

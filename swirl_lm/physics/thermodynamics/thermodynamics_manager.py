@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,13 +57,21 @@ class ThermodynamicsManager(object):
     """Returns the mode of the thermodynamics model."""
     return self._model_params.solver_mode
 
-  def rho_ref(self, zz: Optional[FlowFieldVal] = None) -> FlowFieldVal:
+  def rho_ref(
+      self,
+      zz: Optional[FlowFieldVal] = None,
+      additional_states: Optional[FlowFieldMap] = None,
+  ) -> FlowFieldVal:
     """Generates the reference density."""
-    return self.model.rho_ref(zz)
+    return self.model.rho_ref(zz, additional_states)
 
-  def p_ref(self, zz: Optional[FlowFieldVal] = None) -> FlowFieldVal:
+  def p_ref(
+      self,
+      zz: Optional[FlowFieldVal] = None,
+      additional_states: Optional[FlowFieldMap] = None,
+  ) -> FlowFieldVal:
     """Generates the reference pressure."""
-    return self.model.p_ref(zz)
+    return self.model.p_ref(zz, additional_states)
 
   def update_density(
       self,
@@ -77,7 +85,7 @@ class ThermodynamicsManager(object):
     """Updates the density based on field values provided.
 
     Args:
-      kernel_op: An kernel operation library for finite difference operations.
+      kernel_op: A kernel operation library for finite difference operations.
       replica_id: The index of the current TPU replica.
       replicas: The topology of the TPU partition.
       states: Flow field variables. Must include 'rho'.
@@ -130,7 +138,7 @@ class ThermodynamicsManager(object):
 
         rho = tf.nest.map_structure(tf.math.add, states_0['rho'], drho)
       else:
-        drho = [tf.zeros_like(rho_i) for rho_i in states['rho']]
+        drho = tf.nest.map_structure(tf.zeros_like, states['rho'])
 
       return rho, drho
 
@@ -139,12 +147,13 @@ class ThermodynamicsManager(object):
       # variables. The thermodynamic density is only coupled with the buoyancy
       # following the Boussinesq approximation.
       if 'zz' not in additional_states:
-        zz = [tf.zeros_like(rho_i) for rho_i in states['rho']]
+        zz = tf.nest.map_structure(tf.zeros_like, states['rho'])
       else:
         zz = additional_states['zz']
-      return self.model.rho_ref(zz), [
-          tf.zeros_like(rho_i) for rho_i in states['rho']
-      ]
+      return (
+          self.model.rho_ref(zz, additional_states),
+          tf.nest.map_structure(tf.zeros_like, states['rho']),
+      )
     else:
       raise NotImplementedError(
           '{} is not a valid solver model for density update'.format(

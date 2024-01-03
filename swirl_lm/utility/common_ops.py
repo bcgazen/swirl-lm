@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -228,8 +228,6 @@ def tensor_scatter_1d_update_global(
       false_fn=lambda: tf.nest.map_structure(tf.identity, tensor))
 
 
-# TODO(b/140431015): Clean up upsream callsites that passing down `None` as
-# dtype down.
 def tf_cast(tensor: FlowFieldVal, dtype) -> FlowFieldVal:
   """Casts a sequence of tensors to desired dtype."""
   if dtype is None:
@@ -396,7 +394,7 @@ def group_replicas(
   transpose_axes = remaining_axis + axis
   transposed_replicas = replicas.transpose(transpose_axes)
   # Flatten replica slices.
-  slice_size = np.product([replicas.shape[dim] for dim in axis])
+  slice_size = np.prod([replicas.shape[dim] for dim in axis])
   return transposed_replicas.reshape([-1, slice_size])
 
 
@@ -439,10 +437,10 @@ def prep_step_by_chunk_fn(
 
 def apply_op_x(
     tile_list: FlowFieldVal,
-    mulop: tf.Operation,
+    mulop: tf.Tensor,
 ) -> FlowFieldVal:
   """Apply op in x."""
-  # Handles the case of a signel 3D tf.Tensor.
+  # Handles the case of a single 3D tf.Tensor.
   if isinstance(tile_list, tf.Tensor):
     return tf.einsum('lj,ijk->ilk', mulop, tile_list)
 
@@ -466,7 +464,7 @@ def apply_op_x(
 
 def apply_op_y(
     tile_list: FlowFieldVal,
-    mulop: tf.Operation,
+    mulop: tf.Tensor,
 ) -> FlowFieldVal:
   """Apply op in y."""
   # Handles the case of a single 3D tf.Tensor.
@@ -493,7 +491,7 @@ def apply_op_y(
 
 def apply_op_z(
     tile_list: FlowFieldVal,
-    z_op_list: Sequence[tf.Operation],
+    z_op_list: Sequence[tf.Tensor],
     shift: Optional[Sequence[int]] = None,
 ) -> FlowFieldVal:
   """Apply op in z."""
@@ -781,7 +779,7 @@ def local_dot(
   representing 1-D, 2-D or 3D fields.
 
   Args:
-    vec1: One of the vectors for the dot prodcut.
+    vec1: One of the vectors for the dot product.
     vec2: The other vector for the dot product.
 
   Returns:
@@ -828,7 +826,7 @@ def global_dot(
   representing 1-D, 2-D or 3D fields.
 
   Args:
-    vec1: One of the vectors for the dot prodcut.
+    vec1: One of the vectors for the dot product.
     vec2: The other vector for the dot product.
     group_assignment: A 2d int32 lists with shape [num_groups,
       num_replicas_per_group]
@@ -846,6 +844,7 @@ def global_mean(
     replicas: np.ndarray,
     halos: Sequence[int] = (0, 0, 0),
     axis: Optional[Union[Sequence[int], int]] = None,
+    partition_axis: Optional[Union[Sequence[int], int]] = None,
 ) -> FlowFieldVal:
   """Computes the mean of the tensor in a distributed setting.
 
@@ -870,6 +869,8 @@ def global_mean(
     axis: The dimension to reduce. If None, all dimensions are reduced and the
       result is a scalar. Note the indexing of dimension is [x, y, z] = [0, 1,
       2].
+    partition_axis: The dimensions of the partitions to reduce. If None, it is
+      assumed to be the same as `axis`.
 
   Returns:
     The reduced tensor. If `axis` is None, a scalar that is the global mean of
@@ -879,7 +880,10 @@ def global_mean(
     consistent with the input (either a list of 2D `tf.Tensor` or a single 3D
     `tf.Tensor`.
   """
-  group_assignment = group_replicas(replicas, axis)
+  if partition_axis is None:
+    partition_axis = axis
+
+  group_assignment = group_replicas(replicas, partition_axis)
   group_count = len(group_assignment[0])
   f = strip_halos(f, halos)
 
@@ -997,7 +1001,7 @@ def compute_norm(
     v: The vector to compute norm, a tensor or a list of tensor.
     norm_types: The norm types to be used for computation.
     replicas: A numpy array that maps a replica's grid coordinate to its
-      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
 
   Returns:
     A dict of norms, with the key being the enum name for norm_type and the
@@ -1240,7 +1244,7 @@ def integration_in_dim(
       of 2D `tf.Tensor` (x-y slices) or a single 3D `tf.Tensor`. The integration
       includes all nodes. If there are halos, those nodes will also be included
       in the integration result. Note if it is a list of 2D `tf.Tensor`, the
-      length of the list is `nz` and each silce has the shape [nx, ny]; if it is
+      length of the list is `nz` and each slice has the shape [nx, ny]; if it is
       a single 3D `tf.Tensor`, the shape is [nz, nx, ny].
     h: The uniform grid spacing in the integration direction.
     dim: The dimension along which the integration is performed. The indices
@@ -1405,7 +1409,7 @@ def get_field_inner(
 ) -> Tuple[FlowFieldVal, FlowFieldVal, FlowFieldVal]:
   """Validates and removes the halos of the input field components.
 
-  All three compoenents can be represented as a list of 2D `tf.Tensor` or a
+  All three components can be represented as a list of 2D `tf.Tensor` or a
   single 3D `tf.Tensor` but they must all be in the same format.
 
   Args:
@@ -1429,7 +1433,7 @@ def get_field_inner(
   Returns:
     A tuple with three components each representing the inner part of a field
     component with the halo region removed. Each component is represented in the
-    same format as they are pased in, either as a list of 2D `tf.Tensor` or a
+    same format as they are passed in, either as a list of 2D `tf.Tensor` or a
     single 3D `tf.Tensor`.
   """
   validate_fields(u, v, w)
@@ -1533,33 +1537,34 @@ def get_face(value: FlowFieldVal,
   if isinstance(value, tf.Tensor):
     # Handles the case of single 3D tensor.
     shifted_dim = (dim + 1) % 3
-    n = value.get_shape().as_list()[shifted_dim]
+    shape = value.get_shape().as_list()
+    n = shape[shifted_dim]
+    start_idx = [0, 0, 0]
 
-    slices = [slice(None), slice(None), slice(None)]
     if face == 0:  # low
-      slices[shifted_dim] = slice(index, index + 1)
+      start_idx[shifted_dim] = index
     elif face == 1:  # high
-      slices[shifted_dim] = slice(n - index - 1, n - index)
+      start_idx[shifted_dim] = n - index - 1
 
-    return scaling_factor * value[slices]
+    shape[shifted_dim] = 1
+    return [scaling_factor * tf.slice(value, start_idx, shape)]
 
   # Handles the case of list of 2D tensors.
   nz = len(value)
-  nx, ny = value[0].get_shape().as_list()
-  if dim == 0:  # X
-    if face == 0:  # low
-      bc_value = [[scaling_factor * val[index:index + 1, :] for val in value]]
-    elif face == 1:  # high
-      bc_value = [[
-          scaling_factor * val[nx - index - 1:nx - index, :] for val in value
-      ]]
-  elif dim == 1:  # Y
-    if face == 0:  # low
-      bc_value = [[scaling_factor * val[:, index:index + 1] for val in value]]
-    elif face == 1:  # high
-      bc_value = [[
-          scaling_factor * val[:, ny - index - 1:ny - index] for val in value
-      ]]
+  if dim in (0, 1):
+    shape = value[0].get_shape().as_list()
+    n = shape[dim]
+    start_idx = [0, 0]
+    if face == 0:
+      start_idx[dim] = index
+    elif face == 1:
+      start_idx[dim] = n - index - 1
+    shape[dim] = 1
+    bc_value = [
+        tf.nest.map_structure(
+            lambda x: scaling_factor * tf.slice(x, start_idx, shape), value
+        )
+    ]
   elif dim == 2:  # Z
     if face == 0:  # low
       bc_value = [
@@ -1607,20 +1612,13 @@ def meshgrid(xs: _TensorEquivalent, ys: _TensorEquivalent,
     raise ValueError('Rank for inputs xs, ys, and zs must all be 1, but got '
                      '(%d, %d, %d) instead.' %
                      (xs_ts.shape.rank, ys_ts.shape.rank, zs_ts.shape.rank))
-  xlen = xs_ts.shape.as_list()[0]
-  ylen = ys_ts.shape.as_list()[0]
-  zlen = zs_ts.shape.as_list()[0]
-  xx = tf.matmul(
-      tf.expand_dims(
-          tf.matmul(tf.expand_dims(xs_ts, 1), tf.ones([1, ylen], dtype=_DTYPE)),
-          2), tf.ones([xlen, 1, zlen], dtype=_DTYPE))
-  yy = tf.matmul(
-      tf.expand_dims(
-          tf.matmul(tf.ones([xlen, 1], dtype=_DTYPE), tf.expand_dims(ys_ts, 0)),
-          2), tf.ones([xlen, 1, zlen], dtype=_DTYPE))
-  zz = tf.matmul(
-      tf.ones([xlen, ylen, 1], dtype=_DTYPE),
-      tf.expand_dims(
-          tf.matmul(tf.ones([xlen, 1], dtype=_DTYPE), tf.expand_dims(zs_ts, 0)),
-          1))
+
+  xx = tf.einsum('ij,k->ijk', tf.einsum('i,j->ij', xs_ts, tf.ones_like(ys_ts)),
+                 tf.ones_like(zs_ts))
+  yy = tf.einsum('ij,k->ijk', tf.einsum('i,j->ij', tf.ones_like(xs_ts), ys_ts),
+                 tf.ones_like(zs_ts))
+  zz = tf.einsum('ij,k->ijk',
+                 tf.einsum('i,j->ij', tf.ones_like(xs_ts), tf.ones_like(ys_ts)),
+                 zs_ts)
+
   return xx, yy, zz

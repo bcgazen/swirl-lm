@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -148,9 +148,6 @@ class SimulatedTurbulentInflow():
       plane = tf.squeeze(inflow_data[index, ...])
       tiles = [1, 1, 1]
       tiles[self._inflow_axis] = self._params.halo_width + 1
-      # BEGIN: GOOGLE-INTERNAL
-      # TODO(wqing): Remove the unstack after 3D tf.Tensor is supported.
-      # END: GOOGLE-INTERNAL
       return tf.unstack(
           tf.tile(tf.expand_dims(plane, self._inflow_axis), tiles))
 
@@ -222,17 +219,18 @@ class SimulatedTurbulentInflow():
       raise ValueError(
           'The read_inflow operation is only available for inflow enforcement.')
 
-    states = [
+    states = tuple([
         {
             key: tf.constant(0, dtype=types.TF_DTYPE)
             for key in _INFLOW_DATA_NAMES
         },
-    ] * len(coordinates)
+    ] * len(coordinates))
     return driver_tpu.distributed_read_state(
         strategy, states, coordinates,
         self._model_params.enforcement.inflow_data_dir,
         self._model_params.enforcement.inflow_data_prefix,
-        self._model_params.enforcement.inflow_data_step)
+        tf.constant(
+            self._model_params.enforcement.inflow_data_step, tf.int32))
 
   # This function is not currently used in simulations.
   def update_inflow_states(
@@ -347,9 +345,6 @@ class SimulatedTurbulentInflow():
             lambda bc_0, bc_1: (1.0 - t_fraction) * bc_0 + t_fraction * bc_1,
             bc_val_0, bc_val_1)
 
-        # BEGIN: GOOGLE-INTERNAL
-        # TODO(wqing): Remove the unstack after 3D tf.Tensor is supported.
-        # END: GOOGLE-INTERNAL
         inflow_bc.update({bc_key: tf.unstack(bc_val)})
 
     return inflow_bc

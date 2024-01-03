@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,3 +31,12 @@ CP = GAMMA * R_D / (GAMMA - 1.0)
 
 # The constant volume heat capacity of dry air, in units of J/kg/K.
 CV = CP - R_D
+
+# The molecular mass of dry air (kg/mol).
+DRY_AIR_MOL_MASS = 0.0289647
+
+# The molecular mass of water (kg/mol).
+WATER_MOL_MASS = 0.0180153
+
+# Avogadro's number.
+AVOGADRO = 6.022e23

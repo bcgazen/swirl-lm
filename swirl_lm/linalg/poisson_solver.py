@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,11 +34,12 @@ in a distributed setting.
 """
 
 import functools
-from typing import Any, Callable, Mapping, Optional, Sequence, Text
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Text
 
 import numpy as np
 import scipy as sp
 import scipy.sparse  # pylint: disable=unused-import
+from swirl_lm.base import parameters as parameters_lib
 from swirl_lm.communication import halo_exchange
 from swirl_lm.linalg import base_poisson_solver
 from swirl_lm.linalg import conjugate_gradient_solver
@@ -110,14 +111,17 @@ def _make_laplacian_matrix(
   # where location -1 is the first halo layer, and 0 is the first fluid layer.
   # The homogeneous Neumann BC implies that p_{-1} = p_{0}. With this, the
   # Laplacian operator at the boundary becomes (-p_{0} + p_{1}) / h^2.
-  if bc_type[0] == grid_parametrization_pb2.BC_TYPE_NEUMANN:
+  # Note for now we handle 2nd order estimate Neumann in the same way.
+  if bc_type[0] in (grid_parametrization_pb2.BC_TYPE_NEUMANN,
+                    grid_parametrization_pb2.BC_TYPE_NEUMANN_2):
     a[0, 0] = -1.0
 
   # Following the same logic above, on the high-index side, the Neumann BC
   # is (-p_{n-1} + p_{n}) / h^2. Note that the index -1 here refers to the last
   # element in an array in the python syntax, which is different from the "-1"
   # in the comment above.
-  if bc_type[1] == grid_parametrization_pb2.BC_TYPE_NEUMANN:
+  if bc_type[1] in (grid_parametrization_pb2.BC_TYPE_NEUMANN,
+                    grid_parametrization_pb2.BC_TYPE_NEUMANN_2):
     a[-1, -1] = -1.0
 
   a /= grid_spacing**2
@@ -169,7 +173,7 @@ class FastDiagonalization(PoissonSolver):
     Args:
       replica_id: The ID of the replica.
       replicas: A numpy array that maps a replica's grid coordinate to its
-        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
       rhs: A 3D field stored in a list of `tf.Tensor` that represents the right
         hand side tensor `b` in the Poisson equation.
       p0: A 3D field stored in a list of `tf.Tensor` that provides initial guess
@@ -276,7 +280,7 @@ class ConjugateGradient(PoissonSolver):
     Args:
       replica_id: The ID of the replica.
       replicas: A numpy array that maps a replica's grid coordinate to its
-        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
       rhs: A 3D field stored in a list of `tf.Tensor` that represents the right
         hand side tensor `b` in the Poisson equation.
       p0: A 3D field stored in a list of `tf.Tensor` that provides initial guess
@@ -525,6 +529,10 @@ class Multigrid(PoissonSolver):
     """Initializes the multigrid solver for the Poisson equation."""
     super().__init__(params, kernel_op, solver_option)
 
+    if params.halo_width < 1:
+      raise ValueError('Multgrid solver only supports halo width >= 1.')
+
+    self.extra_halo_width = params.halo_width - 1
     mg_params = self._solver_option.multigrid
 
     for bc in (mg_params.boundary_condition.dim_0,
@@ -533,7 +541,8 @@ class Multigrid(PoissonSolver):
       if bc == grid_parametrization_pb2.BC_TYPE_DIRICHLET:
         self.boundary_conditions.append(
             [(halo_exchange.BCType.DIRICHLET, 0.)] * 2)
-      elif bc == grid_parametrization_pb2.BC_TYPE_NEUMANN:
+      elif bc in (grid_parametrization_pb2.BC_TYPE_NEUMANN,
+                  grid_parametrization_pb2.BC_TYPE_NEUMANN_2):
         self.boundary_conditions.append(
             [(halo_exchange.BCType.NEUMANN, 0.)] * 2)
       else:
@@ -569,12 +578,12 @@ class Multigrid(PoissonSolver):
     Args:
       replica_id: The ID of the replica.
       replicas: A numpy array that maps a replica's grid coordinate to its
-        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
       rhs: A 3D field stored in a list of `tf.Tensor` that represents the right
         hand side tensor `b` in the Poisson equation.
       p: The 3D candidate solution stored in a list of `tf.Tensor`.
-      halo_update_fn: Not used. Multigrid uses the framework's halo exchange
-        function.
+      halo_update_fn: If provided, it is used to perform halo exchange before
+        returning the results so that the final halos will be valid.
       internal_dtype: Not implemented in multigrid.
       additional_states: Additional static fields, prolongation and restriction
         matrices, needed in the computation.
@@ -584,12 +593,40 @@ class Multigrid(PoissonSolver):
         'x': A 3D tensor of the same shape as `rhs` that stores the updated
            candidate solution to the Poisson equation.
     """
-    coordinates = additional_states['coordinates']
-    prs = multigrid_utils.convert_ps_rs_dict_to_tuple(additional_states['ps'],
-                                                      additional_states['rs'])
+    assert additional_states is not None, (
+        'Prolongation and restriction matrices are required from '
+        '`additional_states` by the multigrid solver, but it is not provided.'
+    )
+
+    coordinates = tf.stack(common_ops.get_core_coordinate(replicas, replica_id))
+
+    ps = multigrid_utils.remove_prefix_in_dict(additional_states, 'ps')
+    rs = multigrid_utils.remove_prefix_in_dict(additional_states, 'rs')
+
+    prs = multigrid_utils.convert_ps_rs_dict_to_tuple(ps, rs)
     mg_cycle = self._mg_cycle_step_fn(prs, replica_id, replicas, coordinates)
+
+    # TODO(b/262934073): This is a quick workaround, striping down the halo to
+    # be just 1 as the current multigrid solver assumes it to have one layer
+    # of halos. The correct way is to allow the multigrid solver to support
+    # arbitrary halo sizes.
+    if self.extra_halo_width > 0:
+      p = common_ops.strip_halos(p, [self.extra_halo_width,] * 3)
+      rhs = common_ops.strip_halos(rhs, [self.extra_halo_width,] * 3)
     x = mg_cycle(p, rhs)
 
+    if self.extra_halo_width > 0:
+      if isinstance(x, tf.Tensor):
+        paddings = [[self.extra_halo_width,] * 3,] * 3
+        x = tf.pad(x, paddings, 'CONSTANT')
+      else:  # x is a list of 2D tensor.
+        paddings = [[self.extra_halo_width,] * 2,] * 2
+        x = tf.nest.map_structure(
+            lambda x_i: tf.pad(x_i, paddings, 'CONSTANT'), x)
+        pad_layers = [tf.zeros_like(x[0]),] * self.extra_halo_width
+        x = pad_layers + x + pad_layers
+    if halo_update_fn is not None:
+      x = halo_update_fn(x)
     return {
         X: x,
     }
@@ -648,3 +685,49 @@ def poisson_solver_factory(
     return Multigrid(params, kernel_op, solver_option)
 
   raise ValueError('Unknown Poisson solver option {}.'.format(solver_option))
+
+
+def poisson_solver_helper_variable_keys(
+    params: parameters_lib.SwirlLMParameters,
+) -> List[str]:
+  """Determines the required helper variable keys for the Poisson solver.
+
+  Args:
+    params: An instance of the `SwirlLMParameters` specifying a simulation
+      configuration.
+
+  Returns:
+    A sequence of strings representing helper variables that are required by
+    the selected type of Poisson solver.
+  """
+  if params.pressure is None:
+    return []
+
+  solver_type = params.pressure.solver.WhichOneof('solver')
+  if solver_type == 'multigrid':
+    return multigrid_utils.get_multigrid_helper_var_keys(params)
+  else:
+    return []
+
+
+def poisson_solver_helper_variable_init_fn(
+    params: parameters_lib.SwirlLMParameters,
+) -> Optional[types.InitFn]:
+  """Generates a `InitFn` for helper variables required by the Poisson solver.
+
+  Args:
+    params: An instance of the `SwirlLMParameters` specifying a simulation
+      configuration.
+
+  Returns:
+    A function that initializes the helper variables that are required by the
+    Poisson solver.
+  """
+  if params.pressure is None:
+    return None
+
+  solver_type = params.pressure.solver.WhichOneof('solver')
+  if solver_type == 'multigrid':
+    return multigrid_utils.get_multigrid_helper_var_init_fn(params)
+  else:
+    return None

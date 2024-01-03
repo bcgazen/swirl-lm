@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,6 +61,7 @@ class BCType(enum.Enum):
   DIRICHLET = 2  # Dirichlet boundary condition.
   NO_TOUCH = 3  # Preserves the boundary at its current value.
   ADDITIVE = 4  # Adds the given values at the boundary.
+  NONREFLECTING = 6  # Nonreflecting boundary condition.
 
 _TensorOrArray = Union[tf.Tensor, np.ndarray]
 _FaceBoundaryCondition = Tuple[BCType, Union[Sequence[

@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -125,17 +125,21 @@ def diffusion_scalar(
         lambda f: kernel_op.apply_kernel_op_z(f, 'kdz+', 'kdz+sh'),
     )
 
-    rho_d = [rho_i * d_i for rho_i, d_i in zip(rho, diffusivity)]
+    rho_d = tf.nest.map_structure(tf.multiply, rho, diffusivity)
 
-    rho_d_dim = [[0.5 * rho_d_sum
-                  for rho_d_sum in sum_backward_fn[i](rho_d)]
-                 for i in range(3)]
+    rho_d_dim = [
+        tf.nest.map_structure(
+            lambda rho_d_sum: 0.5 * rho_d_sum, sum_backward_fn[i](rho_d)
+        )
+        for i in range(3)
+    ]
 
     f_diff = [
-        [  # pylint: disable=g-complex-comprehension
-            rho_d_i * d_phi / grid_spacing[i]
-            for rho_d_i, d_phi in zip(rho_d_dim[i], flux_backward_fn[i](phi))
-        ]
+        tf.nest.map_structure(  # pylint: disable=g-complex-comprehension
+            lambda rho_d_i, d_phi: rho_d_i * d_phi / grid_spacing[i],  # pylint: disable=cell-var-from-loop
+            rho_d_dim[i],
+            flux_backward_fn[i](phi),
+        )
         for i in range(3)
     ]
 
@@ -180,13 +184,52 @@ def diffusion_scalar(
             params.halo_width if flux_info.face == 0 else
             (params.nx, params.ny, params.nz)[flux_info.dim] -
             params.halo_width)
+        if flux_info.WhichOneof('flux') == 'value':
+          flux = flux_info.value
+        else:
+          flux = helper_variables[flux_info.varname]
+          assert isinstance(flux, tf.Tensor), (
+              f'The diffusive flux {flux_info.varname} for {scalar_name} in'
+              f' {flux_info.dim} has to be a tf.Tensor, but {type(flux)} is'
+              ' provided.'
+          )
+          # The 2D flux tensor needs prepared as a 3D tensor with its size being
+          # 1 along the flux dimension. If it's provided as a 2D tensor, we need
+          # to add a dummy dimension along the flux dimension.
+          axis = int((flux_info.dim + 1) % 3)
+          if len(flux.shape) == 3:
+            assert flux.shape[axis] == 1, (
+                f'The diffusive flux of {scalar_name} in dim {flux_info.dim} is'
+                f' specified by a 3D tensor {flux_info.varname}, but its size'
+                f' in dim {flux_info.dim} is {flux.shape[axis]} instead of 1.'
+            )
+          else:
+            flux = tf.expand_dims(flux, axis)
+          # If 3D tensors are represented as List[tf.Tensor], we need to convert
+          # the flux variable that is a 2D tf.Tensor to a List[tf.Tensor].
+          # Specifically, if the dimension of the flux is 0, the flux tensor
+          # has to be reshaped as nz x [(1, ny)]; if the dimension is 1, the
+          # shape is nz x [(nx, 1)]; and if the dimension is 2, the shape is
+          # 1 x [(nx, ny)].
+          if not isinstance(f_diff, tf.Tensor):
+            flux = tf.unstack(flux)
         f_diff[flux_info.dim] = common_ops.tensor_scatter_1d_update_global(
-            replica_id, replicas, f_diff[flux_info.dim], flux_info.dim,
-            core_index, plane_index, flux_info.value)
+            replica_id,
+            replicas,
+            f_diff[flux_info.dim],
+            flux_info.dim,
+            core_index,
+            plane_index,
+            flux,
+        )
 
-    return [[
-        d_f_diff / grid_spacing[i] for d_f_diff in grad_forward_fn[i](f_diff[i])
-    ] for i in range(3)]
+    return [
+        tf.nest.map_structure(  # pylint: disable=g-complex-comprehension
+            lambda d_f_diff: d_f_diff / grid_spacing[i],  # pylint: disable=cell-var-from-loop
+            grad_forward_fn[i](f_diff[i]),
+        )
+        for i in range(3)
+    ]
 
   return diffusion_fn
 
@@ -239,30 +282,42 @@ def _diffusion_momentum_stencil_3(
 
   # Prepares the scaled/unscaled viscosity on faces.
   mu_dim = [
-      [0.5 * mu_sum for mu_sum in sum_backward_fn[i](mu)] for i in range(3)
+      tf.nest.map_structure(lambda mu_sum: 0.5 * mu_sum, sum_backward_fn[i](mu))
+      for i in range(3)
   ]
-  four_thirds_mu = [[4.0 / 3.0 * mu_i for mu_i in mu_dim[i]] for i in range(3)]
-  two_thirds_mu = [2.0 / 3.0 * mu_i for mu_i in mu]
+  four_thirds_mu = [
+      tf.nest.map_structure(lambda mu_i: 4.0 / 3.0 * mu_i, mu_dim[i])
+      for i in range(3)
+  ]
+  two_thirds_mu = tf.nest.map_structure(lambda mu_i: 2.0 / 3.0 * mu_i, mu)
 
+  # pylint: disable=g-complex-comprehension
   # Computes velocity gradients on faces along all directions. These gradients
   # used to compute second order derivatives of velocity along the gradient
   # direction.
-  flux_u = {  # pylint: disable=g-complex-comprehension
-      k: [[
-          flux / grid_spacing[dim]
-          for flux in flux_backward_fn[dim](velocity[k])
+  flux_u = {
+      k: [
+          tf.nest.map_structure(
+              lambda flux: flux / grid_spacing[dim],  # pylint: disable=cell-var-from-loop
+              flux_backward_fn[dim](velocity[k]),
+          )
+          for dim in range(3)
       ]
-          for dim in range(3)] for k in common.KEYS_VELOCITY
+      for k in common.KEYS_VELOCITY
   }
   # Computes velocity gradients with central difference. These gradients are
   # used to compute the cross terms in second order derivatives of velocity.
-  grad_central_u = {  # pylint: disable=g-complex-comprehension
-      k: [[
-          grad / (2.0 * grid_spacing[dim])
-          for grad in grad_central_fn[dim](velocity[k])
+  grad_central_u = {
+      k: [
+          tf.nest.map_structure(
+              lambda grad: grad / (2.0 * grid_spacing[dim]),  # pylint: disable=cell-var-from-loop
+              grad_central_fn[dim](velocity[k]),
+          )
+          for dim in range(3)
       ]
-          for dim in range(3)] for k in common.KEYS_VELOCITY
+      for k in common.KEYS_VELOCITY
   }
+  # pylint: enable=g-complex-comprehension
 
   # Functions that are used to compute the diffusion terms.
   def tangential_diffusion_fn(dim):
@@ -409,7 +464,8 @@ def diffusion_momentum(
       """Computes the diffusion term for `key` in direction `dim`."""
       shear = tau[shear_key[key][dim]]
       h = grid_spacing[dim]
-      return [d_flux / (grad_width * h) for d_flux in diff_op[dim](shear)]
+      return tf.nest.map_structure(lambda d_flux: d_flux / (grad_width * h),
+                                   diff_op[dim](shear))
 
     diff = {
         key: [diffusion_fn(key, i) for i in range(3)

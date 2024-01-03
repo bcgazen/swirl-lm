@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,7 +47,9 @@ from swirl_lm.base import parameters as parameters_lib
 from swirl_lm.base import physical_variable_keys_manager
 from swirl_lm.equations import common
 from swirl_lm.numerics import root_finder
+from swirl_lm.physics import constants
 from swirl_lm.utility import common_ops
+from swirl_lm.utility import debug_print
 from swirl_lm.utility import get_kernel_fn
 from swirl_lm.utility import grid_parametrization
 from swirl_lm.utility import types
@@ -61,8 +63,9 @@ FlowFieldMap = types.FlowFieldMap
 _KAPPA = 0.4
 # The stability correction for momentum.
 _PHI_M = 0.0
-# The acceleration of gravity.
-_G = 9.81
+# The threshold of the ratio between the height of the first fluid layer and the
+# surface roughness.
+_HEIGHT_TO_SURFACE_ROUGHNESS_RATIO_THRESHOLD = 1.1
 
 
 class MoninObukhovSimilarityTheory(object):
@@ -96,6 +99,8 @@ class MoninObukhovSimilarityTheory(object):
     self.enable_theta_reg = most_params.enable_theta_reg
     self.theta_max = most_params.theta_max
     self.theta_min = most_params.theta_min
+
+    self.dbg = most_params.debug
 
     self.bc_manager = (
         physical_variable_keys_manager.BoundaryConditionKeysHelper())
@@ -261,8 +266,8 @@ class MoninObukhovSimilarityTheory(object):
         v: tf.Tensor,
     ) -> tf.Tensor:
       """Computes the Richardson number."""
-      return _G * height * tf.math.divide_no_nan(t - self.t_s,
-                                                 (u**2 + v**2) * t)
+      return constants.G * height * tf.math.divide_no_nan(t - self.t_s,
+                                                          (u**2 + v**2) * t)
 
     return tf.nest.map_structure(richardson_number, theta, u1, u2)
 
@@ -398,6 +403,12 @@ class MoninObukhovSimilarityTheory(object):
 
     q_3 = tf.nest.map_structure(surface_heat_flux, theta, u_s, phi_h)
 
+    if self.dbg:
+      tau_13 = debug_print.log_mean_min_max(tau_13, message='tau_13')
+      tau_23 = debug_print.log_mean_min_max(tau_23, message='tau_23')
+      u_s = debug_print.log_mean_min_max(u_s, message='u_s')
+      q_3 = debug_print.log_mean_min_max(q_3, message='q_3')
+
     return tau_13, tau_23, q_3
 
   def surface_shear_stress_and_heat_flux_update_fn(
@@ -456,7 +467,7 @@ class MoninObukhovSimilarityTheory(object):
       height: The height of the first grid point.
       varname: The name of the variable for which the exchange coefficient is
         computed. If not provided, assume this variable is a scalar instead of
-        an velocity/momentum component.
+        a velocity/momentum component.
 
     Returns:
       The exchange coefficient for the energy equation.
@@ -545,20 +556,33 @@ class MoninObukhovSimilarityTheory(object):
           phi_zm_i - phi_z0_i)
 
     if isinstance(phi_z0, Sequence) and isinstance(c_h, Sequence):
-      return tf.nest.map_structure(scalar_flux, rho, c_h, u1, u2, phi_zm,
-                                   phi_z0)
+      sc_flux = tf.nest.map_structure(
+          scalar_flux, rho, c_h, u1, u2, phi_zm, phi_z0
+      )
     elif isinstance(c_h, Sequence):
-      return tf.nest.map_structure(
-          functools.partial(scalar_flux, phi_z0_i=phi_z0), rho, c_h, u1, u2,
-          phi_zm)
+      sc_flux = tf.nest.map_structure(
+          functools.partial(scalar_flux, phi_z0_i=phi_z0),
+          rho,
+          c_h,
+          u1,
+          u2,
+          phi_zm,
+      )
     elif isinstance(phi_z0, Sequence):
       flux_fn = lambda rho_i, u1_i, u2_i, phi_zm_i, phi_z0_i: scalar_flux(  # pylint: disable=g-long-lambda
-          rho_i, c_h, u1_i, u2_i, phi_zm_i, phi_z0_i)
-      return tf.nest.map_structure(flux_fn, rho, u1, u2, phi_zm, phi_z0)
+          rho_i, c_h, u1_i, u2_i, phi_zm_i, phi_z0_i
+      )
+      sc_flux = tf.nest.map_structure(flux_fn, rho, u1, u2, phi_zm, phi_z0)
     else:
       flux_fn = lambda rho_i, u1_i, u2_i, phi_zm_i: scalar_flux(  # pylint: disable=g-long-lambda
-          rho_i, c_h, u1_i, u2_i, phi_zm_i, phi_z0)
-      return tf.nest.map_structure(flux_fn, rho, u1, u2, phi_zm)
+          rho_i, c_h, u1_i, u2_i, phi_zm_i, phi_z0
+      )
+      sc_flux = tf.nest.map_structure(flux_fn, rho, u1, u2, phi_zm)
+
+    if self.dbg:
+      sc_flux = debug_print.log_mean_min_max(sc_flux, message='scalar_flux')
+
+    return sc_flux
 
   def neumann_bc_update_fn(
       self,
@@ -601,7 +625,7 @@ class MoninObukhovSimilarityTheory(object):
     def get_potential_temperature(variables):
       """Retrieves potential temperature from a dictionary of variables."""
       if 'T' in variables:
-        # Temperature is used interchangably with potential temperature because
+        # Temperature is used interchangeably with potential temperature because
         # they are almost identical on the ground.
         return variables['T']
       elif 'theta' in variables:
@@ -621,10 +645,6 @@ class MoninObukhovSimilarityTheory(object):
     helper_states.update({'theta': theta})
 
     # Get the turbulent viscosity and diffusivity.
-    # BEGIN: GOOGLE_INTERNAL
-    # TODO(b/242739803): Add support for turbulent diffusivity computed from
-    # scalar gradients.
-    # END: GOOGLE_INTERNAL
     nu_t = additional_states.get('nu_t', 0.0)
     if self.params.sgs_model.WhichOneof('sgs_model_type') == 'smagorinsky':
       pr_t = self.params.sgs_model.smagorinsky.pr_t
@@ -691,9 +711,6 @@ class MoninObukhovSimilarityTheory(object):
 
     return additional_states_new
 
-  # BEGIN: GOOGLE_INTERNAL
-  # TODO(b/240981325): Remove functions in this class from this line below.
-  # END: GOOGLE_INTERNAL
   def _compute_obukhov_length(
       self,
       m: tf.Tensor,
@@ -733,7 +750,8 @@ class MoninObukhovSimilarityTheory(object):
     Returns:
       The Obukhov length.
     """
-    param = tf.math.divide_no_nan(m**2 / _G * self.t_0, temperature - self.t_s)
+    param = tf.math.divide_no_nan(m**2 / constants.G * self.t_0,
+                                  temperature - self.t_s)
 
     a = self.beta_m**2 + tf.math.divide_no_nan(param * self.beta_h, z_m)
     b = 2.0 * self.beta_m * tf.math.log(z_m / self.z_0) + tf.math.divide_no_nan(
@@ -751,7 +769,8 @@ class MoninObukhovSimilarityTheory(object):
   def _compute_monin_obukhov_length_scale(self, u_star, temperature, heat_flux):
     """Computes the Monin-Obukhov length scale."""
     return [
-        tf.math.divide_no_nan(-u_star_i**3 * t_i, _KAPPA * _G * heat_flux)
+        tf.math.divide_no_nan(-u_star_i**3 * t_i,
+                              _KAPPA * constants.G * heat_flux)
         for u_star_i, t_i in zip(u_star, temperature)
     ]
 
@@ -1252,6 +1271,8 @@ def monin_obukhov_similarity_theory_factory(
     ValueError: If `most` is not defined in the parameter context.
     ValueError: If `gravity_direction` is absent, or is not aligned with a
       particular dimension.
+    AssertionError: If the first fluid layer is below the tolerated surface
+      roughness.
   """
   if not params.boundary_models.HasField('most'):
     raise ValueError(
@@ -1275,5 +1296,19 @@ def monin_obukhov_similarity_theory_factory(
     raise ValueError(
         'Gravity must be defined to use the Monin-Obukhov boundary layer '
         'model.')
+
+  # If the height of the first fluid layer is close or below the surface
+  # roughness, the wall is considered resolved, and a non-slip wall should be
+  # used without the MOST model.
+  height = 0.5 * (params.dx, params.dy, params.dz)[vertical_dim]
+  z_0 = (
+      _HEIGHT_TO_SURFACE_ROUGHNESS_RATIO_THRESHOLD
+      * params.boundary_models.most.z_0
+  )
+  assert height > z_0, (
+      f'The height of the first fluid layer ({height} m) is below the tolerated'
+      f' surface roughness ({z_0} m). MOST model should be disabled and'
+      ' replaced by a non-slip wall BC.'
+  )
 
   return MoninObukhovSimilarityTheory(params, vertical_dim)

@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,7 +58,6 @@ from swirl_lm.physics.thermodynamics import thermodynamics_pb2
 from swirl_lm.physics.thermodynamics import water
 from swirl_lm.physics.turbulence import sgs_model
 from swirl_lm.utility import common_ops
-from swirl_lm.utility import components_debug
 from swirl_lm.utility import get_kernel_fn
 from swirl_lm.utility import monitor
 from swirl_lm.utility import types
@@ -68,7 +67,6 @@ import tensorflow as tf
 FlowFieldVal = types.FlowFieldVal
 FlowFieldMap = types.FlowFieldMap
 
-_GRAVITY = 9.81
 # A small number that's used as the threshold for the gravity vector. If the
 # absolute value of a gravity component is less than this threshold, it is
 # considered as 0 when computing the free slip wall boundary condition.
@@ -105,7 +103,6 @@ class Velocity(object):
       thermodynamics: thermodynamics_manager.ThermodynamicsManager,
       monitor_lib: monitor.Monitor,
       ib: Optional[immersed_boundary_method.ImmersedBoundaryMethod] = None,
-      dbg: Optional[components_debug.ComponentsDebug] = None,
   ):
     """Initializes the velocity update library."""
     self._kernel_op = kernel_op
@@ -168,8 +165,6 @@ class Velocity(object):
     self._ib = ib if ib is not None else (
         immersed_boundary_method.immersed_boundary_method_factory(self._params))
 
-    self._dbg = dbg
-
   def _exchange_halos(self, f, bc_f, replica_id, replicas):
     """Performs halo exchange for the variable f."""
     return halo_exchange.inplace_halo_exchange(
@@ -213,12 +208,11 @@ class Velocity(object):
       self,
       replica_id: tf.Tensor,
       replicas: np.ndarray,
+      states_mid: FlowFieldMap,
       additional_states: FlowFieldMap,
       mu: FlowFieldVal,
       p: FlowFieldVal,
-      rho_mix: Optional[FlowFieldVal] = None,
       forces: Sequence[Optional[FlowFieldVal]] = (None, None, None),
-      dbg: bool = False,
   ):
     """Provides a function that computes the RHS of the momentum equation.
 
@@ -238,32 +232,39 @@ class Velocity(object):
     Args:
       replica_id: The index of the current TPU replica.
       replicas: A numpy array that maps grid coordinates to replica id numbers.
+      states_mid: Flow field variables at the middle step between each velocity
+        time steps. Specifically, for velocity advancing from step n to n + 1,
+        the velocity and momentum components are 0.5 * (`states` + `states_0`),
+        scalars and the density are associated with `states_0`.
       additional_states: A dictionary that holds helper variable fields for the
         source term computation.
       mu: Dynamic viscosity of the flow field.
       p: Pressure.
-      rho_mix: Density of the inert mixture.
       forces: A three component sequence with each component being the external
         forces applied to its corresponding dimension.
-      dbg: An option of whether the debug mode is on. If `True`, a dictionary of
-        all terms in the equation will be returned instead of the right hand
-        side update.
 
     Returns:
       momentum_function: A function that computes the `f(rhou)`.
     """
 
-    if rho_mix is None:
-      rho_mix = [self._params.rho * tf.ones_like(p_i) for p_i in p]
+    rho_mix = states_mid.get(
+        'rho_thermal',
+        tf.nest.map_structure(
+            lambda p_i: self._params.rho * tf.ones_like(p_i), p
+        ),
+    )
 
-    zz = additional_states['zz'] if 'zz' in additional_states.keys() else [
-        tf.zeros_like(p_i, dtype=p_i.dtype) for p_i in p
-    ]
-    rho_ref = self._thermodynamics.rho_ref(zz)
+    zz = additional_states.get('zz', tf.nest.map_structure(tf.zeros_like, p))
+    rho_ref = self._thermodynamics.rho_ref(zz, additional_states)
 
-    def momentum_function(rho_u: FlowFieldVal, rho_v: FlowFieldVal,
-                          rho_w: FlowFieldVal, u: FlowFieldVal, v: FlowFieldVal,
-                          w: FlowFieldVal):
+    def momentum_function(
+        rho_u: FlowFieldVal,
+        rho_v: FlowFieldVal,
+        rho_w: FlowFieldVal,
+        u: FlowFieldVal,
+        v: FlowFieldVal,
+        w: FlowFieldVal,
+    ):
       """Computes the functional RHS for the three momentum equations.
 
       NB: values in `halo_width` <= 2 returned by this function are invalid.
@@ -290,18 +291,17 @@ class Velocity(object):
         ValueError: If `option` is not one of: 'CENTRAL' 'QUICK'.
       """
 
-      states = {
+      states = {key: val for key, val in states_mid.items()}
+      states.update({
           _KEY_RHO_U: rho_u,
           _KEY_RHO_V: rho_v,
           _KEY_RHO_W: rho_w,
           _KEY_U: u,
           _KEY_V: v,
           _KEY_W: w,
-          _KEY_RHO: rho_mix,
           _KEY_P: p,
-      }
-      velocity_key = _KEYS_VELOCITY
-      momentum_key = _KEYS_MOMENTUM
+      })
+
       h = (self._params.dx, self._params.dy, self._params.dz)
       dt = self._params.dt
 
@@ -318,108 +318,87 @@ class Velocity(object):
 
       def momentum_function_in_dim(dim):
         """Computes the RHS of the momentum equation in `dim`."""
-        f = states[velocity_key[dim]]
+        f = states[_KEYS_VELOCITY[dim]]
 
         gravity = eq_utils.buoyancy_source(self._kernel_op, rho_mix, rho_ref,
                                            self._params, dim)
-
         # Computes the convection term.
         g_corr = None if np.abs(
             self._gravity_vec[dim]) < _G_THRESHOLD else gravity
-        if (self._params.convection_scheme !=
-            _ConvectionScheme.CONVECTION_SCHEME_WENO):
-          # Pressure is used for the Rhie-Chow correction in schemes other than
-          # WENO.
-          p_corr = [p,] * 3
-        else:
-          # The pressure gradient term is included in the convection term when
-          # the WENO scheme is used. This eliminates the need for the Rhie-Chow
-          # correction.
-          p_corr = [tf.nest.map_structure(tf.zeros_like, p) for _ in range(3)]
-          p_corr[dim] = p
+        p_corr = [p,] * 3
         conv = [
             convection.convection_term(  # pylint: disable=g-complex-comprehension
                 self._kernel_op,
                 replica_id,
                 replicas,
                 f,
-                states[momentum_key[i]],
+                states[_KEYS_MOMENTUM[i]],
                 p_corr[i],
                 h[i],
                 dt,
                 i,
-                tuple(self._params.bc_type[i]),
-                momentum_key[i],
-                self._params.halo_width,
-                self._params.convection_scheme,
+                bc_types=tuple(self._params.bc_type[i]),
+                varname=_KEYS_MOMENTUM[i],
+                halo_width=self._params.halo_width,
+                scheme=self._params.convection_scheme,
+                flux_scheme=self._params.numerical_flux,
                 src=g_corr,
                 apply_correction=self._params.enable_rhie_chow_correction)
             for i in range(3)
         ]
 
         # Computes the diffusion term.
-        diff = diff_all[velocity_key[dim]]
+        diff = diff_all[_KEYS_VELOCITY[dim]]
 
         # Computes the pressure gradient.
-        if (self._params.convection_scheme ==
-            _ConvectionScheme.CONVECTION_SCHEME_WENO):
-          # The pressure contribution is considered with the convection when
-          # WENO scheme is used to eliminate the need for Rhie-Chow correction.
-          dp_dh = tf.nest.map_structure(tf.zeros_like, p)
-        elif (self._thermodynamics.solver_mode ==
-              thermodynamics_pb2.Thermodynamics.ANELASTIC):
+        if (
+            self._thermodynamics.solver_mode
+            == thermodynamics_pb2.Thermodynamics.ANELASTIC
+        ):
           alpha = tf.nest.map_structure(tf.math.reciprocal, rho_ref)
           a_p = tf.nest.map_structure(tf.math.multiply, alpha, p)
-          d_ap_dh = tf.nest.map_structure(lambda d_ap: d_ap / (2.0 * h[dim]),
-                                          self.grad_central[dim](a_p))
+          d_ap_dh = tf.nest.map_structure(
+              lambda d_ap: d_ap / (2.0 * h[dim]), self.grad_central[dim](a_p)
+          )
           # Modified pressure gradient term.
           dp_dh = tf.nest.map_structure(tf.math.multiply, rho_ref, d_ap_dh)
         else:
-          dp_dh = tf.nest.map_structure(lambda dp_: dp_ / (2.0 * h[dim]),
-                                        self.grad_central[dim](p))
+          dp_dh = tf.nest.map_structure(
+              lambda dp_: dp_ / (2.0 * h[dim]), self.grad_central[dim](p)
+          )
 
         # Computes external forcing terms.
-        force = forces[dim] if forces[dim] else [
-            tf.zeros_like(f_i) for f_i in f
-        ]
+        force = forces[dim] if forces[dim] else (
+            tf.nest.map_structure(tf.zeros_like, f))
 
-        source_fn = self._params.source_update_fn(velocity_key[dim])
+        source_fn = self._params.source_update_fn(_KEYS_VELOCITY[dim])
 
         if source_fn is not None:
           source = source_fn(self._kernel_op, replica_id, replicas, states,
                              additional_states,
                              self._params)[self._src_manager.generate_src_key(
-                                 velocity_key[dim])]
+                                 _KEYS_VELOCITY[dim])]
           force = tf.nest.map_structure(tf.math.add, force, source)
 
-        if dbg:
-          return {
-              'conv_x': conv[0],
-              'conv_y': conv[1],
-              'conv_z': conv[2],
-              'diff_x': diff[0],
-              'diff_y': diff[1],
-              'diff_z': diff[2],
-              'gravity': gravity,
-              'force': force,
-          }
+        momentum_terms = (conv[0], conv[1], conv[2], diff[0], diff[1], diff[2],
+                          dp_dh, gravity, force)
 
-        momentum_terms = zip(conv[0], conv[1], conv[2], diff[0], diff[1],
-                             diff[2], dp_dh, gravity, force)
-
-        rhs = [
-            -c_x - c_y - c_z + d_x + d_y + d_z - dp_dh_i + gravity_i + force_i
-            for c_x, c_y, c_z, d_x, d_y, d_z, dp_dh_i, gravity_i, force_i in
-            momentum_terms
-        ]
+        def _rhs_fn(c_x, c_y, c_z, d_x, d_y, d_z, dp_dh_i, gravity_i, force_i):
+          return (
+              -c_x - c_y - c_z + d_x + d_y + d_z - dp_dh_i + gravity_i + force_i
+          )
+        rhs = tf.nest.map_structure(_rhs_fn, *momentum_terms)
 
         if self._ib is not None:
-          var_name = momentum_key[dim]
+          var_name = _KEYS_MOMENTUM[dim]
           rhs_name = self._ib.ib_rhs_name(var_name)
-          helper_states = {
-              rhs_name: rhs,
-              'ib_interior_mask': additional_states['ib_interior_mask'],
-          }
+          helper_states = {rhs_name: rhs}
+          for helper_var_name in ('ib_interior_mask', 'ib_boundary'):
+            if helper_var_name in additional_states:
+              helper_states[helper_var_name] = additional_states[
+                  helper_var_name
+              ]
+
           rhs_ib_updated = self._ib.update_forcing(self._kernel_op, replica_id,
                                                    replicas,
                                                    {var_name: states[var_name]},
@@ -446,7 +425,7 @@ class Velocity(object):
     fluid layer. For a velocity component to be 0 at this face, the first halo
     layer that is adjacent to the fluid is set to the opposite of the first
     fluid layer, so that the interpolated value on the face between them is 0.
-    Values in the ghost cells are extrapolated linear based on these 2 layres,
+    Values in the ghost cells are extrapolated linear based on these 2 layers,
     which provides a 0 flux at the face with the QUICK scheme.
 
     For non-slip walls, all velocity components at the wall are set to zero. So
@@ -566,9 +545,11 @@ class Velocity(object):
         e = thermal_model.internal_energy_from_total_energy(
             states['e_t'], states[_KEY_U], states[_KEY_V], states[_KEY_W], zz)
         temperature = thermal_model.saturation_adjustment(
-            'e_int', e, states[_KEY_RHO], q_t)
-        theta = thermal_model.potential_temperatures(temperature, q_t,
-                                                     states[_KEY_RHO], zz)
+            'e_int', e, states[_KEY_RHO], q_t, zz, additional_states
+        )
+        theta = thermal_model.potential_temperatures(
+            temperature, q_t, states[_KEY_RHO], zz, additional_states
+        )
         helper_variables.update({'theta': theta['theta_v']})
       else:
         raise ValueError(
@@ -587,7 +568,7 @@ class Velocity(object):
 
     This function is called before the beginning of each time step. It updates
     the boundary conditions of 'u', 'v', 'w', and the shear stresses if
-    required. It also updates the forcing term of each momentum components.
+    required. It also updates the forcing term of each momentum component.
     These information will be hold within this helper object.
 
     Args:
@@ -616,6 +597,22 @@ class Velocity(object):
     self._source.update(
         self._src_manager.update_helper_variable_from_additional_states(
             additional_states))
+
+  def _maybe_update_diagnostics(
+      self, additional_states, states_0, template_state):
+    """Updates diagnostics states if specified in the config."""
+    diagnostics = {}
+    for i, buoyancy_key in enumerate(common.KEYS_DIAGNOSTICS_BUOYANCY):
+      if buoyancy_key in additional_states.keys():
+        zz = additional_states.get(
+            'zz', tf.nest.map_structure(tf.zeros_like, template_state))
+        rho_ref = self._thermodynamics.rho_ref(zz, additional_states)
+        diagnostics.update({
+            buoyancy_key:
+            eq_utils.buoyancy_source(
+                self._kernel_op, states_0['rho_thermal'], rho_ref,
+                self._params, i)})
+    return diagnostics
 
   def prediction_step(
       self,
@@ -658,32 +655,30 @@ class Velocity(object):
           (u_mid, v_mid, w_mid),
           replicas=replicas,
           additional_states=additional_states)
-      mu = [(self._params.nu + nu_t_i) * rho_i
-            for nu_t_i, rho_i in zip(nu_t, states_0[_KEY_RHO])]
+      mu = tf.nest.map_structure(
+          lambda nu_t_i, rho_i: (self._params.nu + nu_t_i) * rho_i, nu_t,
+          states_0[_KEY_RHO])
     else:
-      mu = [self._params.nu * rho_i for rho_i in states_0[_KEY_RHO]]
+      mu = tf.nest.map_structure(lambda rho_i: self._params.nu * rho_i,
+                                 states_0[_KEY_RHO])
 
     forces = [self._source[_KEY_U], self._source[_KEY_V], self._source[_KEY_W]]
 
-    momentum_rhs = self._momentum_update(replica_id, replicas, helper_variables,
-                                         mu, states[_KEY_P],
-                                         states_0['rho_thermal'], forces)
+    momentum_rhs = self._momentum_update(
+        replica_id,
+        replicas,
+        states_mid,
+        helper_variables,
+        mu,
+        states[_KEY_P],
+        forces,
+    )
 
     rho_u, rho_v, rho_w = time_integration.time_advancement_explicit(
         functools.partial(momentum_rhs, u=u_mid, v=v_mid, w=w_mid),
         self._params.dt, self._params.time_integration_scheme,
         (states_0[_KEY_RHO_U], states_0[_KEY_RHO_V], states_0[_KEY_RHO_W]),
         (states[_KEY_RHO_U], states[_KEY_RHO_V], states[_KEY_RHO_W]))
-
-    if self._dbg is not None:
-      rho_u_m = common_ops.average(states_0[_KEY_RHO_U], rho_u)
-      rho_v_m = common_ops.average(states_0[_KEY_RHO_V], rho_v)
-      rho_w_m = common_ops.average(states_0[_KEY_RHO_W], rho_w)
-      terms = self._momentum_update(replica_id, replicas, additional_states, mu,
-                                    states[_KEY_P], states_0['rho_thermal'],
-                                    forces, True)(rho_u_m, rho_v_m, rho_w_m,
-                                                  u_mid, v_mid, w_mid)
-      updated_velocity.update(self._dbg.update_momentum_terms(terms))
 
     states_buf = {
         _KEY_U: tf.nest.map_structure(tf.math.divide, rho_u, rho_mid),
@@ -722,6 +717,9 @@ class Velocity(object):
 
     if 'nu_t' in additional_states.keys() and self._use_sgs:
       updated_velocity.update({'nu_t': nu_t})
+
+    updated_velocity.update(
+        self._maybe_update_diagnostics(additional_states, states_0, u))
 
     return updated_velocity  # pytype: disable=bad-return-type
 

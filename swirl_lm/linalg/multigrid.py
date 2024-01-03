@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -163,7 +163,7 @@ def mg_cycle(
       W-cycle.
     replica_id: The replica id.
     replicas: A numpy array that maps a replica's grid coordinate to its
-      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
     coordinates: The coordinates of this replica (as a tensor or array).
     num_cycles: The number of multigrid cycles to perform.
 
@@ -198,7 +198,7 @@ def mg_cycle(
   return x
 
 
-def poisson_mg_cycle_fn_for_one_core(
+def poisson_mg_cycle_fn_for_one_core(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     full_grid_shape: Sequence[int],
     n_coarse: int = 1,
     n_smooth: int = 1,
@@ -292,7 +292,7 @@ def poisson_mg_cycle_fn_for_one_core(
   return mg_cycle_fn
 
 
-def poisson_mg_cycle_fn(
+def poisson_mg_cycle_fn(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     params: grid_parametrization.GridParametrization,
     prs: ProlongRestrictMatrices,
     boundary_conditions: halo_exchange_utils.BoundaryConditionsSpec,
@@ -329,7 +329,7 @@ def poisson_mg_cycle_fn(
       exactly.
     replica_id: The replica id.
     replicas: A numpy array that maps a replica's grid coordinate to its
-      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+      replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
     coordinates: The coordinates of this replica (as a tensor or array).
     num_cycles: The number of cycles.
     dtype: The dtype.
@@ -360,7 +360,7 @@ def poisson_mg_cycle_fn(
   return mg_cycle_fn
 
 
-def poisson_mg_cycle_step_fn(
+def poisson_mg_cycle_step_fn(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     params: grid_parametrization.GridParametrization,
     coarsest_subgrid_shape: Optional[Sequence[int]] = None,
     n_coarse: int = 1,

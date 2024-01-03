@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,8 @@ def _grad_impl(kernel_op: get_kernel_fn.ApplyKernelOp, state: FlowFieldVal,
   else:  # dim == 2
     d_state = kernel_op.apply_kernel_op_z(state, 'kDz', 'kDzsh')
 
-  return [d_state_i / (2.0 * grid_spacing) for d_state_i in d_state]
+  return tf.nest.map_structure(
+      lambda d_state_i: d_state_i / (2.0 * grid_spacing), d_state)
 
 
 def grad(
@@ -89,24 +90,34 @@ def divergence(
     ValueError: If the length of either `field_var` or `delta` is not 3.
   """
   if len(field_var) != 3:
-    raise ValueError('The vector has to have exactly 3 components to '
-                     'compute the divergence. {} is given.'.format(
-                         len(field_var)))
+    raise ValueError(
+        'The vector has to have exactly 3 components to '
+        'compute the divergence. {} is given.'.format(len(field_var))
+    )
 
   if len(delta) != 3:
     raise ValueError(
         'The length mesh size vector has to be 3. {} is given.'.format(
-            len(delta)))
+            len(delta)
+        )
+    )
 
   gradients = [
       _grad_impl(kernel_op, field_var[i], i, delta[i]) for i in range(3)
   ]
+  return tf.nest.map_structure(
+      lambda ddx, ddy, ddz: ddx + ddy + ddz, *gradients
+  )
 
-  return [ddx + ddy + ddz for ddx, ddy, ddz in zip(*gradients)]
 
-
-def laplacian(kernel_op: get_kernel_fn.ApplyKernelOp, f: FlowFieldVal,
-              nu: float, dx: float, dy: float, dz: float) -> FlowFieldVal:
+def laplacian(
+    kernel_op: get_kernel_fn.ApplyKernelOp,
+    f: FlowFieldVal,
+    nu: float,
+    dx: float,
+    dy: float,
+    dz: float,
+) -> FlowFieldVal:
   """Computes ν times the Laplacian of `f`.
 
   Args:

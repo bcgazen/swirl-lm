@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,16 @@
 
 """Library for input config for the incompressible Navier-Stokes solver."""
 
+import copy
+import os
+import os.path
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 
 from absl import flags
 from absl import logging
 import numpy as np
 from swirl_lm.base import parameters_pb2
+from swirl_lm.base import physical_variable_keys_manager
 from swirl_lm.boundary_condition import boundary_condition_utils
 from swirl_lm.boundary_condition import boundary_conditions_pb2
 from swirl_lm.communication import halo_exchange
@@ -33,14 +37,81 @@ import tensorflow as tf
 
 from google.protobuf import text_format
 
+# The threshold of the difference between the absolute value of the
+# gravitational vector along a dimension and one. Below this threshold the
+# cooresponding dimension is the gravity (vertical) dimension.
+_G_THRESHOLD = 1e-6
+
 flags.DEFINE_string(
     'config_filepath', None,
-    'The full path to the text proto file that stores all input parameters.')
+    'The full path to the text proto file that stores all input parameters.'
+)
 flags.DEFINE_bool(
     'simulation_debug',
     False,
     'Toggles if to run the simulation with the debug mode.',
     allow_override=True)
+# Note that these flags are ineffective if they are set in the config.
+_NUM_CYCLES = flags.DEFINE_integer(
+    'num_cycles',
+    1,
+    'number of cycles to run. Each cycle generates a set of output',
+)
+_NUM_STEPS = flags.DEFINE_integer(
+    'num_steps', 1, 'number of steps to run before generating an output.'
+)
+_APPLY_PREPROCESS = flags.DEFINE_bool(
+    'apply_preprocess',
+    False,
+    (
+        'If True and the `preprocessing_states_update_fn` is defined in'
+        ' `params`, data from initial condition are processed before the'
+        ' simulation.'
+    ),
+)
+_PREPROCESS_STEP_ID = flags.DEFINE_integer(
+    'preprocess_step_id',
+    0,
+    (
+        'The `step_id` for the preprocessing function to be executed at, or if '
+        '`preprocess_periodic` is `True`, the period in steps to perform '
+        'preprocessing.'
+    ),
+)
+_PREPROCESS_PERIODIC = flags.DEFINE_bool(
+    'preprocess_periodic', False, 'Whether to do preprocess periodically.'
+)
+_APPLY_POSTPROCESS = flags.DEFINE_bool(
+    'apply_postprocess',
+    False,
+    (
+        'If True and the `postprocessing_states_update_fn` is defined in'
+        ' `params`, a post processing will be executed after the update.'
+    ),
+)
+_POSTPROCESS_STEP_ID = flags.DEFINE_integer(
+    'postprocess_step_id',
+    0,
+    (
+        'The `step_id` for the postprocessing function to be executed at, or if'
+        ' `postprocess_periodic` is `True`, the period in steps to perform'
+        ' postprocessing.'
+    ),
+)
+_POSTPROCESS_PERIODIC = flags.DEFINE_bool(
+    'postprocess_periodic', False, 'Whether to do postprocess periodically.'
+)
+_START_STEP = flags.DEFINE_integer(
+    'start_step', 0, 'The beginning step count for the current simulation.'
+)
+_LOADING_STEP = flags.DEFINE_integer(
+    'loading_step',
+    None,
+    (
+        'When this is set, it is the step count from which to '
+        'load the initial states.'
+    ),
+)
 
 KernelOpType = parameters_pb2.SwirlLMParameters.KernelOpType
 SolverProcedure = parameters_pb2.SwirlLMParameters.SolverProcedureType
@@ -57,8 +128,42 @@ SourceUpdateFnLib = Mapping[str, SourceUpdateFn]
 
 _BCInfo = boundary_conditions_pb2.BoundaryCondition.BoundaryInfo
 _BCType = grid_parametrization_pb2.BoundaryConditionType
+_BCParams = boundary_conditions_pb2.BoundaryCondition.BoundaryConditionParams
 
 FLAGS = flags.FLAGS
+
+
+def _get_gravity_direction(
+    config: parameters_pb2.SwirlLMParameters,
+) -> Sequence[float]:
+  """Derives the gravitational vector from the configuration.
+
+  Args:
+    config: An instance of the `SwirlLMParameters` proto.
+
+  Returns:
+    A 3-component vector that represents the direction of the gravity
+    (normalized) if `gravity_direction` is defined in the simulation
+    configuration and the magnitude is non-trivial; otherwise a vector with all
+    zeros is returned.
+  """
+  if config.HasField('gravity_direction'):
+    gravity_direction = [
+        config.gravity_direction.dim_0, config.gravity_direction.dim_1,
+        config.gravity_direction.dim_2
+    ]
+    # Normalize the gravitational vector.
+    g_magnitude = np.linalg.norm(gravity_direction)
+    if g_magnitude > _G_THRESHOLD:
+      gravity_direction = [
+          g_dir / g_magnitude for g_dir in gravity_direction
+      ]
+    else:
+      gravity_direction = [0.] * 3
+  else:
+    gravity_direction = [0.] * 3
+
+  return gravity_direction
 
 
 class SwirlLMParameters(grid_parametrization.GridParametrization):
@@ -72,10 +177,32 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
   ):
     super(SwirlLMParameters, self).__init__(grid_params)
 
+    self.swirl_lm_parameters_proto = config
+    self.bc_manager = (
+        physical_variable_keys_manager.BoundaryConditionKeysHelper())
+
+    self._start_step = _START_STEP.value
+    self._loading_step = (
+        _LOADING_STEP.value
+        if _LOADING_STEP.value is not None
+        else self._start_step
+    )
+
     self.kernel_op_type = config.kernel_op_type
+    if config.kernel_op_type == KernelOpType.KERNEL_OP_CONV:
+      self._kernel_op = get_kernel_fn.ApplyKernelConvOp(self.kernel_size)
+    elif config.kernel_op_type == KernelOpType.KERNEL_OP_SLICE:
+      self._kernel_op = get_kernel_fn.ApplyKernelSliceOp()
+    elif config.kernel_op_type == KernelOpType.KERNEL_OP_MATMUL:
+      self._kernel_op = get_kernel_fn.ApplyKernelMulOp(self.nx, self.ny)
+    else:
+      raise ValueError(
+          'Unknown kernel operator {}'.format(config.kernel_op_type)
+      )
 
     self.solver_procedure = config.solver_procedure
     self.convection_scheme = config.convection_scheme
+    self.numerical_flux = config.numerical_flux
     self.diffusion_scheme = config.diffusion_scheme
     self.time_integration_scheme = config.time_integration_scheme
 
@@ -89,6 +216,8 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
 
     self.thermodynamics = config.thermodynamics if config.HasField(
         'thermodynamics') else None
+    self.radiative_transfer = config.radiative_transfer if config.HasField(
+        'radiative_transfer') else None
 
     if (self.thermodynamics is not None and
         self.thermodynamics.HasField('solver_mode')):
@@ -108,22 +237,57 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
 
     self.use_sgs = config.use_sgs
     self.sgs_model = config.sgs_model
+    self.use_3d_tf_tensor = config.use_3d_tf_tensor
 
     # Initialize the direction vector of gravitational force. Set to 0 if
     # gravity is not defined in the simulation.
-    if config.HasField('gravity_direction'):
-      self.gravity_direction = [
-          config.gravity_direction.dim_0, config.gravity_direction.dim_1,
-          config.gravity_direction.dim_2
-      ]
-    else:
-      self.gravity_direction = [0.] * 3
+    self.gravity_direction = _get_gravity_direction(config)
+
+    g_dim = np.unique(
+        np.nonzero(np.abs(np.abs(self.gravity_direction) - 1.0) < _G_THRESHOLD)
+    )
+    assert len(g_dim) <= 1, (
+        'Gravity dimension is ambiguous if it is not aligned with an axis.'
+        f' {g_dim} is provided.'
+    )
+    self.g_dim = g_dim.item() if len(g_dim) == 1 else None
 
     # Get the scalar related quantities if scalars are solved as a
     # `List[SwirlLMParameters.Scalar]`.
     self.scalars = config.scalars
 
     self.scalar_lib = {scalar.name: scalar for scalar in self.scalars}
+
+    # Check if the microphysics model (if used) is the same for all scalars.
+    microphysics = None
+    for scalar in self.scalars:
+      scalar_config = scalar.WhichOneof('scalar_config')
+      microphysics_current = None
+      if scalar_config == 'total_energy':
+        if scalar.total_energy.HasField('microphysics'):
+          microphysics_current = scalar.total_energy.WhichOneof('microphysics')
+      elif scalar_config == 'humidity':
+        if scalar.humidity.HasField('microphysics'):
+          microphysics_current = scalar.humidity.WhichOneof('microphysics')
+      elif scalar_config == 'potential_temperature':
+        if scalar.potential_temperature.HasField('microphysics'):
+          microphysics_current = scalar.potential_temperature.WhichOneof(
+              'microphysics'
+          )
+      else:
+        continue
+
+      # No microphsyics model is defined for the present scalar, so skip.
+      if microphysics_current is None:
+        continue
+
+      if microphysics is None:
+        microphysics = microphysics_current
+      else:
+        assert microphysics == microphysics_current, (
+            f'{scalar_config} is using a different microphysics model'
+            f' ({microphysics_current}) from others ({microphysics}).'
+        )
 
     # Boundary conditions.
     self.periodic_dims = [
@@ -132,11 +296,13 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
 
     self.bc = {'u': None, 'v': None, 'w': None, 'p': None}
     self.bc.update({scalar.name: None for scalar in self.scalars})
+    self.bc_params = {'u': None, 'v': None, 'w': None, 'p': None}
+    self.bc_params.update({scalar.name: None for scalar in self.scalars})
 
     for input_bc in config.boundary_conditions:
-      self.bc.update({
-          input_bc.name: self._parse_boundary_conditions(input_bc.boundary_info)
-      })
+      bc, bc_params = self._parse_boundary_conditions(input_bc.boundary_info)
+      self.bc[input_bc.name] = bc
+      self.bc_params[input_bc.name] = bc_params
 
     # Find the type of boundary, e.g. wall, open boundary, periodic, from the
     # boundary conditions.
@@ -147,6 +313,12 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
     logging.info('Boundary conditions for `u`, `v`, `w`, and all scalars are '
                  'retrieved from the config file. Boundary condition for `p` '
                  'is derived based on boundary types.')
+
+    # Adding new additional keys to hold boundary conditions.
+    self.bc_keys = (
+        boundary_condition_utils.get_keys_for_boundary_condition(
+            self.bc, halo_exchange.BCType.NONREFLECTING))
+    self.additional_state_keys.extend(self.bc_keys)
 
     # Get the number of sub-iterations at each time step.
     self.corrector_nit = config.num_sub_iterations
@@ -180,11 +352,10 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
     self.density_update_option = config.density_update_option
 
     # Get the information required for sponge layers if applied.
-    if (config.HasField('boundary_models') and
-        config.boundary_models.HasField('sponge')):
+    if config.HasField('boundary_models') and config.boundary_models.sponge:
       self.sponge = config.boundary_models.sponge
     elif config.HasField('sponge_layer'):
-      self.sponge = config.sponge_layer
+      self.sponge = [config.sponge_layer]
     else:
       self.sponge = None
 
@@ -207,26 +378,178 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
     # Toggle if to run with the debug mode.
     self.dbg = FLAGS.simulation_debug
 
+    # Get the number of cycles and steps the simulation needs to run. Member
+    # variables `_num_cycles` and `_num_steps` will be initialized.
+    self._set_simulation_time_info()
+
+    # Determine the pre- and post-process options.
+    self._set_pre_post_process_info()
+
   def __str__(self) -> str:
     return super(SwirlLMParameters, self).__str__() + (
         ', rho: {}, nu: {}, nit: {}'.format(self.rho, self.nu, self.nit))
 
-  def _parse_boundary_info(
-      self,
-      boundary_info: _BCInfo) -> Optional[Tuple[halo_exchange.BCType, float]]:
-    """Retrieves the boundary condition from proto to fit the framework."""
-    if boundary_info.type == _BCType.BC_TYPE_DIRICHLET:
-      return (halo_exchange.BCType.DIRICHLET, boundary_info.value)
-    elif boundary_info.type == _BCType.BC_TYPE_NEUMANN:
-      return (halo_exchange.BCType.NEUMANN, boundary_info.value)
-    elif boundary_info.type == _BCType.BC_TYPE_NO_TOUCH:
-      return (halo_exchange.BCType.NO_TOUCH, 0.0)
+  def _get_inflow_velocity(self, inflow_dim: int, inflow_face: int) -> float:
+    """Retrieves the inflow velocity from the simulation setup."""
+    assert (
+        self.bc_type[inflow_dim][inflow_face]
+        == boundary_condition_utils.BoundaryType.INFLOW
+    ), (
+        'Simulation setup with `from_flow_through_time` requires a boundary'
+        '  type of `INFLOW` in the dimension specified'
+        f' ({inflow_dim}), but is'
+        f' {self.bc_type[inflow_dim][inflow_face]}.'
+    )
+
+    inflow_velocity_name = ('u', 'v', 'w')[inflow_dim]
+
+    return np.abs(
+        self.bc[inflow_velocity_name][inflow_dim][inflow_face][1]
+    )
+
+  def _get_flow_through_time(self, inflow_dim: int, inflow_face: int) -> float:
+    """Computes the flow through time with an inflow boundary condition."""
+    inflow_domain_length = (self.lx, self.ly, self.lz)[inflow_dim]
+    inflow_val = self._get_inflow_velocity(inflow_dim, inflow_face)
+    return inflow_domain_length / inflow_val
+
+  def _set_simulation_time_info(self):
+    """Sets `_num_cycles` and `_num_steps` with a lazy approach.
+
+    Note that values for `num_steps` and `num_cycles` from the flags are not
+    used if the `simulation_time_method` is `from_config` or
+    `from_flow_through_time` even they are provided.
+    """
+    config = self.swirl_lm_parameters_proto
+    if (
+        not config.HasField('simulation_time_info')
+        or config.simulation_time_info.WhichOneof('simulation_time_method')
+        == 'from_flags'
+    ):
+      self._num_cycles = _NUM_CYCLES.value
+      self._num_steps = _NUM_STEPS.value
+    elif (
+        config.simulation_time_info.WhichOneof('simulation_time_method')
+        == 'from_config'
+    ):
+      self._num_cycles = config.simulation_time_info.from_config.num_cycles
+      self._num_steps = config.simulation_time_info.from_config.num_steps
+    elif (
+        config.simulation_time_info.WhichOneof('simulation_time_method')
+        == 'from_flow_through_time'
+    ):
+      inflow_dim = (
+          config.simulation_time_info.from_flow_through_time.mean_flow_dim
+      )
+      inflow_face = (
+          config.simulation_time_info.from_flow_through_time.inflow_face
+      )
+      self._num_cycles = (
+          config.simulation_time_info.from_flow_through_time.num_cycles
+      )
+      n_flow_through_time = (
+          config.simulation_time_info.from_flow_through_time.n_flow_through_time
+      )
+      t_per_cycle = (
+          n_flow_through_time
+          * self._get_flow_through_time(inflow_dim, inflow_face)
+      ) / float(self._num_cycles)
+      self._num_steps = int(np.ceil(t_per_cycle / self.dt))
     else:
-      return None
+      raise ValueError(
+          'Unknown simulation time info:'
+          f' {config.simulation_time_info.WhichOneof("simulation_time_method")}'
+      )
+
+  def _set_pre_post_process_info(self):
+    """Determines the pre- and post-process options.
+
+    Note that values for `apply_[pre,post]process`, `[pre,post]process_step_id`,
+    and `[pre,post]process_periodic` from the flags are not used if the
+    `pre_post_process_option` is `from_config` or `from_flow_through_time` even
+    they are provided.
+    """
+    config = self.swirl_lm_parameters_proto
+    if (
+        not config.HasField('pre_post_process_info')
+        or config.pre_post_process_info.WhichOneof('pre_post_process_option')
+        == 'from_flags'
+    ):
+      self._apply_preprocess = _APPLY_PREPROCESS.value
+      self._preprocess_step_id = _PREPROCESS_STEP_ID.value
+      self._preprocess_periodic = _PREPROCESS_PERIODIC.value
+      self._apply_postprocess = _APPLY_POSTPROCESS.value
+      self._postprocess_step_id = _POSTPROCESS_STEP_ID.value
+      self._postprocess_periodic = _POSTPROCESS_PERIODIC.value
+    elif (
+        config.pre_post_process_info.WhichOneof('pre_post_process_option')
+        == 'from_config'
+    ):
+      opt = config.pre_post_process_info.from_config
+      self._apply_preprocess = opt.apply_preprocess
+      self._preprocess_step_id = opt.preprocess_step_id
+      self._preprocess_periodic = opt.preprocess_periodic
+      self._apply_postprocess = opt.apply_postprocess
+      self._postprocess_step_id = opt.postprocess_step_id
+      self._postprocess_periodic = opt.postprocess_periodic
+    elif (
+        config.pre_post_process_info.WhichOneof('pre_post_process_option')
+        == 'from_flow_through_time'
+    ):
+      opt = config.pre_post_process_info.from_flow_through_time
+      self._apply_preprocess = opt.apply_preprocess
+      self._preprocess_periodic = opt.preprocess_periodic
+      self._apply_postprocess = opt.apply_postprocess
+      self._postprocess_periodic = opt.postprocess_periodic
+
+      flow_through_time = self._get_flow_through_time(
+          opt.mean_flow_dim, opt.inflow_face
+      )
+
+      def get_step_id(t: float) -> int:
+        """Computes the closest integer multiple of `num_step` to `t`."""
+        return (
+            self.start_step
+            + round(t / (float(self.num_steps) * self.dt)) * self.num_steps
+        )
+
+      self._preprocess_step_id = get_step_id(
+          opt.preprocess_flow_through_time * flow_through_time
+      )
+      self._postprocess_step_id = get_step_id(
+          opt.postprocess_flow_through_time * flow_through_time
+      )
+    else:
+      pre_post_opt = config.pre_post_process_info.WhichOneof(
+          'pre_post_process_option'
+      )
+      raise ValueError(f'Unknown pre-post process info: {pre_post_opt}')
+
+  def _parse_boundary_info(
+      self, boundary_info: _BCInfo
+  ) -> Tuple[
+      Optional[Tuple[halo_exchange.BCType, float]],
+      Optional[_BCParams]]:
+    """Retrieves the boundary condition from proto to fit the framework."""
+    bc_type_value = None
+    if boundary_info.type == _BCType.BC_TYPE_DIRICHLET:
+      bc_type_value = (halo_exchange.BCType.DIRICHLET, boundary_info.value)
+    elif boundary_info.type == _BCType.BC_TYPE_NEUMANN:
+      bc_type_value = (halo_exchange.BCType.NEUMANN, boundary_info.value)
+    elif boundary_info.type == _BCType.BC_TYPE_NEUMANN_2:
+      bc_type_value = (halo_exchange.BCType.NEUMANN_2, boundary_info.value)
+    elif boundary_info.type == _BCType.BC_TYPE_NO_TOUCH:
+      bc_type_value = (halo_exchange.BCType.NO_TOUCH, 0.0)
+    elif boundary_info.type == _BCType.BC_TYPE_NONREFLECTING:
+      bc_type_value = (halo_exchange.BCType.NONREFLECTING, boundary_info.value)
+
+    return (bc_type_value, boundary_info.bc_params)
 
   def _parse_boundary_conditions(
       self, boundary_conditions: Sequence[_BCInfo]
-  ) -> List[List[Optional[Tuple[halo_exchange.BCType, float]]]]:
+  ) -> Tuple[
+      List[List[Optional[Tuple[halo_exchange.BCType, float]]]],
+      List[List[Optional[_BCParams]]]]:
     """Parses the boundary conditions.
 
     Args:
@@ -238,9 +561,12 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
     """
 
     bc = [[None, None], [None, None], [None, None]]
+    bc_params = [[None, None], [None, None], [None, None]]
     for bc_info in boundary_conditions:
-      bc[bc_info.dim][bc_info.location] = self._parse_boundary_info(bc_info)
-    return bc
+      (bc[bc_info.dim][bc_info.location],
+       bc_params[bc_info.dim][bc_info.location]) = self._parse_boundary_info(
+           bc_info)
+    return bc, bc_params
 
   @staticmethod
   def config_from_text_proto(
@@ -275,10 +601,63 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
           grid_parametrization_pb2.GridParametrization] = None,
   ) -> 'SwirlLMParameters':
     """Reads the config text proto file."""
-    with tf.io.gfile.GFile(config_filepath, 'r') as f:
-      text_proto = f.read()
+    text_proto: str = None
+    if text_proto is None:
+      with tf.io.gfile.GFile(config_filepath, 'r') as f:
+        text_proto = f.read()
+      logging.info('Loaded config file `%s` from file.', config_filepath)
 
     return SwirlLMParameters.config_from_text_proto(text_proto, grid_params)
+
+  @property
+  def num_cycles(self) -> int:
+    """Provides the number of cycles for the simulation to run."""
+    return self._num_cycles
+
+  @property
+  def num_steps(self) -> int:
+    """Provides the number of steps in each simulation cycle."""
+    return self._num_steps
+
+  @property
+  def start_step(self) -> int:
+    """Provides the step id to start the simulation."""
+    return self._start_step
+
+  @property
+  def loading_step(self):
+    """Provides the data load id to start the simulation."""
+    return self._loading_step
+
+  @property
+  def apply_preprocess(self) -> bool:
+    """Provides the option for whether pre-process is applied."""
+    return self._apply_preprocess
+
+  @property
+  def apply_postprocess(self) -> bool:
+    """Provides the option for whether post-process is applied."""
+    return self._apply_postprocess
+
+  @property
+  def preprocess_step_id(self) -> int:
+    """The step id at which preprocess is applied."""
+    return self._preprocess_step_id
+
+  @property
+  def postprocess_step_id(self) -> int:
+    """The step id at which postprocess is applied."""
+    return self._postprocess_step_id
+
+  @property
+  def preprocess_periodic(self) -> bool:
+    """The option of whether preprocess function is applied periodically."""
+    return self._preprocess_periodic
+
+  @property
+  def postprocess_periodic(self) -> bool:
+    """The option of whether postprocess function is applied periodically."""
+    return self._postprocess_periodic
 
   @property
   def max_halo_width(self) -> int:
@@ -411,10 +790,15 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
       The function that updates `states` and `additional_states`, which takes
       the following arguments:
       `kernel_op`, `states`, `additional_states`, `params`,
-      and it should return a dictionary containing the updated `states` and/or
+     and it should return a dictionary containing the updated `states` and/or
       `additional_states`.
     """
     return self._postprocessing_states_update_fn
+
+  @property
+  def kernel_op(self):
+    """A shallow copy of the `ApplyKernelOp` instance."""
+    return copy.copy(self._kernel_op)
 
   @preprocessing_states_update_fn.setter
   def preprocessing_states_update_fn(self, update_fn):
@@ -425,6 +809,37 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
   def postprocessing_states_update_fn(self, update_fn):
     """Sets the function that postprocesses `states`."""
     self._postprocessing_states_update_fn = update_fn
+
+  def maybe_grid_vertical(
+      self,
+      replica_id: tf.Tensor,
+      replicas: np.ndarray,
+  ) -> types.FlowFieldVal:
+    """The vertical grid local to `replica_id` if `g_dim` is not None.
+
+    Note that this function supports flow field variables that are represented
+    as List[tf.Tensor] only.
+
+    Args:
+      replica_id: The index of the current replica.
+      replicas: A 3D tensor that saves the topology of the partitioning.
+
+    Returns:
+      The local grid (with halo) along the gravity direction. If no gravity
+      direction is specified, returns zeros that has the same structure as the
+      flow field.
+    """
+    if self.g_dim == 0:
+      grid_vertical = self.x_local_ext(replica_id, replicas)
+      return [grid_vertical[:, tf.newaxis]] * self.nz
+    elif self.g_dim == 1:
+      grid_vertical = self.y_local_ext(replica_id, replicas)
+      return [grid_vertical[tf.newaxis, :]] * self.nz
+    elif self.g_dim == 2:
+      grid_vertical = self.z_local_ext(replica_id, replicas)
+      return tf.unstack(grid_vertical, num=self.nz)
+    else:
+      return [tf.zeros((1, 1), dtype=types.TF_DTYPE)] * self.nz
 
   def diffusivity(self, scalar_name: str) -> float:
     """Retrieves the diffusivity of a scalar.
@@ -507,6 +922,19 @@ class SwirlLMParameters(grid_parametrization.GridParametrization):
           break
 
     return self.time_integration_scheme
+
+  def save_to_file(self, prefix: str) -> None:
+    """Saves configuration protos as text to files with the given prefix."""
+    output_dir, _ = os.path.split(prefix)
+    tf.io.gfile.makedirs(output_dir)
+    with tf.io.gfile.GFile(f'{prefix}_swirl_lm.pbtxt', 'w') as f:
+      f.write(text_format.MessageToString(self.swirl_lm_parameters_proto))
+    with tf.io.gfile.GFile(get_grid_pbtxt_path(prefix), 'w') as f:
+      f.write(text_format.MessageToString(self.grid_params_proto))
+
+
+def get_grid_pbtxt_path(prefix: str) -> str:
+  return f'{prefix}_grid.pbtxt'
 
 
 def params_from_config_file_flag() -> SwirlLMParameters:

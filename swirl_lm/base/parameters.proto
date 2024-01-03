@@ -23,6 +23,7 @@ import "swirl_lm/equations/pressure.proto";
 import "swirl_lm/equations/scalars.proto";
 import "swirl_lm/numerics/numerics.proto";
 import "swirl_lm/physics/combustion/combustion.proto";
+import "swirl_lm/physics/radiation/config/radiative_transfer.proto";
 import "swirl_lm/physics/thermodynamics/thermodynamics.proto";
 import "swirl_lm/utility/grid_parametrization.proto";
 import "swirl_lm/utility/monitor.proto";
@@ -38,7 +39,102 @@ message PeriodicDimensions {
   optional bool dim_2 = 3 [default = false];
 }
 
+// Methods for how the simulation time, including the number of cycles
+// (`num_cycles`) and number of steps per cycles (`num_steps`), are determined.
+// Next id: 4
+message SimulationTimeInfo {
+  // Parameters are passed in from flags.
+  message FromFlags {}
+
+  // Parameters are passed in from the config file.
+  message FromConfig {
+    optional int32 num_cycles = 1;
+    optional int32 num_steps = 2;
+  }
+
+  // Parameters are derived from the flow through times that is computed as
+  // l / bc_u in the `mean_flow_dim`. Note that this option is only valid if
+  // the face with index `inflow_face` along the `mean_flow_dim` is associated
+  // with an inflow boundary type.
+  // Next id: 5
+  message FromFlowThroughTime {
+    // The number of cycles the simulation runs. This parameter determines the
+    // total number of restart files to be dumped.
+    optional int32 num_cycles = 1;
+
+    // The dimension along with the flow through time is computed. Must be one
+    // of 0, 1, and 2.
+    optional int32 mean_flow_dim = 2;
+
+    // The face from which the inflow is going into the domain. 0 for the lower
+    // index end, and 1 for the higher index end.
+    optional int32 inflow_face = 3;
+
+    // The total number of flow through times that the simulation needs to
+    // cover.
+    optional float n_flow_through_time = 4;
+  }
+
+  oneof simulation_time_method {
+    FromFlags from_flags = 1;
+    FromConfig from_config = 2;
+    FromFlowThroughTime from_flow_through_time = 3;
+  }
+}
+
+// Options for performing pre- and post-process in the simulation.
+// Next id: 4
+message PrePostProcessInfo {
+  // Initializes pre- and post-process options from command line flags.
+  message FromFlags {}
+
+  // Initializes pre- and post-process options from the config file.
+  // Next id: 7
+  message FromConfig {
+    optional bool apply_preprocess = 1;
+    optional int32 preprocess_step_id = 2;
+    optional bool preprocess_periodic = 3;
+    optional bool apply_postprocess = 4;
+    optional int32 postprocess_step_id = 5;
+    optional bool postprocess_periodic = 6;
+  }
+
+  // Initializes pre- and post-process options from flow through time. Note that
+  // this option is only valid if the face with index `inflow_face along the
+  // `mean_flow_dim` is associated with an inflow boundary type. The pre- and
+  // post-process step id will be rounded to the closest integer multiple of
+  // `num_steps`.
+  // Next id: 9
+  message FromFlowThroughTime {
+    optional bool apply_preprocess = 1;
+    optional bool preprocess_periodic = 2;
+    optional bool apply_postprocess = 3;
+    optional bool postprocess_periodic = 4;
+
+    // The dimension along with the flow through time is computed. Must be one
+    // of 0, 1, and 2.
+    optional int32 mean_flow_dim = 5;
+
+    // The face from which the inflow is going into the domain. 0 for the lower
+    // index end, and 1 for the higher index end.
+    optional int32 inflow_face = 6;
+
+    // The flow through time at which pre-process is applied.
+    optional float preprocess_flow_through_time = 7;
+
+    // The flow through time at which post-process is applied.
+    optional float postprocess_flow_through_time = 8;
+  }
+
+  oneof pre_post_process_option {
+    FromFlags from_flags = 1;
+    FromConfig from_config = 2;
+    FromFlowThroughTime from_flow_through_time = 3;
+  }
+}
+
 // Stores information about a sub-grid scale model.
+// Next id: 8
 message SubGridScaleModel {
   // Parameters required by the constant Smagorinsky model.
   message SmagorinskyModel {
@@ -100,10 +196,16 @@ message SubGridScaleModel {
 
   // An upper bound of the turbulent diffusivity.
   optional float diff_t_max = 5 [default = 1.0];
+
+  // A lower bound of the turbulent viscosity.
+  optional float nu_t_min = 6 [default = 0.0];
+
+  // A lower bound of the turbulent diffusivity.
+  optional float diff_t_min = 7 [default = 0.0];
 }
 
 // Stores the parameters required by an incompressible Navier-Stokes simulation.
-// Next id: 33
+// Next id: 38
 message SwirlLMParameters {
   // Defines the type of the simulation procedure to be used in the solver.
   enum SolverProcedureType {
@@ -146,8 +248,8 @@ message SwirlLMParameters {
     KERNEL_OP_MATMUL = 3;
   }
 
-  // The mesh information.
-  optional swirl_lm.GridParametrization grid_info = 1;
+  // The mesh information. Deprecated. Do not use / rely on this.
+  optional swirl_lm.GridParametrization grid_info = 1 [deprecated = true];
   // The type of kernel operator to be used to represent finite difference
   // operators. Default set to `KERNEL_OP_CONV` to match previous behavior.
   optional KernelOpType kernel_op_type = 27 [default = KERNEL_OP_CONV];
@@ -155,6 +257,10 @@ message SwirlLMParameters {
   // The scheme used to discretize the convection term.
   optional ConvectionScheme convection_scheme = 2
       [default = CONVECTION_SCHEME_UNKNOWN];
+  // The numerical flux for the convection term. Setting default to upwinding
+  // for backward compatibility.
+  optional NumericalFlux numerical_flux = 35
+      [default = NUMERICAL_FLUX_UPWINDING];
   // The scheme used to discretize the diffusion term.
   optional DiffusionScheme diffusion_scheme = 25
       [default = DIFFUSION_SCHEME_CENTRAL_5];
@@ -167,6 +273,14 @@ message SwirlLMParameters {
   // In this case, the scalar specific one will overwrite the shared one here.
   optional TimeIntegrationScheme time_integration_scheme = 3
       [default = TIME_SCHEME_UNKNOWN];
+
+  // The option for how the number of cycles and steps are determined. If not
+  // set, `num_cycles` and `num_steps` will be set from flags.
+  optional SimulationTimeInfo simulation_time_info = 33;
+
+  // The option for how the pre- and post-process options are specified. If not
+  // set, these options will be determined from flags.
+  optional PrePostProcessInfo pre_post_process_info = 34;
 
   // An option for enabling the correction of primitive scalars after the
   // density update from the equation of state. If it is `true`, results of
@@ -245,4 +359,10 @@ message SwirlLMParameters {
   optional MonitorSpec monitor_spec = 28;
   // Specification of probes that retrieves values at user specified locations.
   optional Probe probe = 29;
+  // If True, all field variables are 3D tf.Tensor. Otherwise, they are
+  // Sequence[tf.Tensor].
+  optional bool use_3d_tf_tensor = 36 [default = false];
+  // The radiation model that solves a two-stream radiative transfer equation
+  // taking into account the full atmospheric state.
+  optional RadiativeTransfer radiative_transfer = 37;
 }

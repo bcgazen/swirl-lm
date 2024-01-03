@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,7 +59,7 @@ References:
 """
 
 import functools
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 from swirl_lm.base import parameters as parameters_lib
@@ -138,6 +138,8 @@ def _reaction_rate(
     s_b: float,
     s_x: float,
     c_f: float,
+    t_0_ivf: float,
+    t_1_ivf: float,
 ) -> tf.Tensor:
   """Computes the reation rate of the wood combustion.
 
@@ -153,6 +155,8 @@ def _reaction_rate(
     s_b: The B scale of the fuel elements.
     s_x: The scale of the smallest fuel elements.
     c_f: An empirical scaling coefficient in local fire reaction rates.
+    t_0_ivf: Start temperature for the ramp up.
+    t_1_ivf: End temperature for the ramp up.
 
   Returns:
     The reaction rate due to wood combustion.
@@ -163,11 +167,9 @@ def _reaction_rate(
     return 0.09 * rho_g * s_b * tf.math.sqrt(tke)
 
   def psi_s():
-    """Computes the ignition volume fraction."""
-    return tf.math.minimum(
-        tf.math.maximum((temperature - 300.0) / 400.0,
-                        tf.zeros_like(temperature, dtype=_TF_DTYPE)),
-        tf.ones_like(temperature, dtype=_TF_DTYPE))
+    """Computes the ignited volume fraction."""
+    return tf.clip_by_value((temperature - t_0_ivf) / (t_1_ivf - t_0_ivf),
+                            0.0, 1.0)
 
   def lambda_of():
     """Computes 𝛌of = ϱf ϱo / (ϱf / Nf + ϱo / No)2."""
@@ -269,13 +271,21 @@ def _theta(
   if not rho_f_init:
     # Assume reaction heat transfer to gas and solid with equal probability
     # if the initial fuel state is missing.
-    return [0.5 * tf.ones_like(rho_f_i, dtype=_TF_DTYPE) for rho_f_i in rho_f]
+    return tf.nest.map_structure(
+        lambda rho_f_i: 0.5 * tf.ones_like(rho_f_i), rho_f
+    )
 
   rho_f_0 = rho_f_init
-  return [
-      1.0 - tf.math.divide_no_nan(rho_f_i, rho_f_0_i)
-      for rho_f_i, rho_f_0_i in zip(rho_f, rho_f_0)
-  ]
+
+  # Note that `divide_no_nan` is used here, which returns 0 when the initial
+  # fuel density is 0. This suggests that no heat is transferred to the solid
+  # when there is no fuel.
+  return tf.nest.map_structure(
+      lambda rho_f_i, rho_f_0_i: 1.0  # pylint: disable=g-long-lambda
+      - tf.math.divide_no_nan(rho_f_i, rho_f_0_i),
+      rho_f,
+      rho_f_0,
+  )
 
 
 def _localize_by_fuel(
@@ -312,10 +322,11 @@ def _compute_mid_state(
   Returns:
     The state at the middle of the time step.
   """
-  return [
-      0.5 * (state_new_i + state_old_i)
-      for state_new_i, state_old_i in zip(state_new, state_old)
-  ]
+  return tf.nest.map_structure(
+      lambda state_new_i, state_old_i: 0.5 * (state_new_i + state_old_i),
+      state_new,
+      state_old,
+  )
 
 
 class Wood(object):
@@ -329,38 +340,41 @@ class Wood(object):
         simulation.
     """
     self.model_params = config.combustion.wood
+    params = self.model_params
 
-    self.s_b = self.model_params.s_b
-    self.s_x = self.model_params.s_x
-    self.h_conv = self.model_params.h_conv
-    self.a_v = self.model_params.a_v
-    self.cp_g = self.model_params.cp_g
-    self.h_f = self.model_params.h_f
-    self.t_pyr = self.model_params.t_pyr
-    self.n_step = self.model_params.n_step
-    self.include_radiation = self.model_params.include_radiation
-    self.t_ambient = self.model_params.t_ambient
-    self.efficiency = self.model_params.efficiency
-    self.c_f = self.model_params.c_f
+    self.s_b = params.s_b
+    self.s_x = params.s_x
+    self.h_conv = params.h_conv
+    self.a_v = params.a_v
+    self.cp_g = params.cp_g
+    self.h_f = params.h_f
+    self.t_pyr = params.t_pyr
+    self.n_step = params.n_step
+    self.include_radiation = params.include_radiation
+    self.efficiency = params.efficiency
+    self.c_f = params.c_f
     self.reaction_integration_scheme = (
-        self.model_params.reaction_integration_scheme)
+        params.reaction_integration_scheme)
 
     self.thermodynamics_model = thermodynamics_manager.thermodynamics_factory(
         config)
 
     self.reaction_rate = functools.partial(
-        _reaction_rate, s_b=self.s_b, s_x=self.s_x, c_f=self.c_f)
+        _reaction_rate, s_b=self.s_b, s_x=self.s_x, c_f=self.c_f,
+        t_0_ivf=params.t_0_ivf, t_1_ivf=params.t_1_ivf)
 
-    if self.model_params.WhichOneof('combustion_model_option') == 'dry_wood':
-      self.combustion_model_option = self.model_params.dry_wood
+    self.combustion_model_option = params.WhichOneof(
+        'combustion_model_option'
+    )
+    if self.combustion_model_option == 'dry_wood':
       self.update_fn = self.dry_wood_update_fn
-    elif self.model_params.WhichOneof(
-        'combustion_model_option') == 'moist_wood':
-      self.combustion_model_option = self.model_params.moist_wood
+    elif self.combustion_model_option == 'moist_wood':
       self.update_fn = self.moist_wood_update_fn
     else:
-      self.combustion_model_option = None
-      self.update_fn = None
+      raise NotImplementedError(
+          f'{self.combustion_model_option} is not a valid combustion model.'
+          ' Available options are: `dry_wood`, `moist_wood`.'
+      )
 
   def _src_t_g(
       self,
@@ -369,6 +383,7 @@ class Wood(object):
       theta: tf.Tensor,
       f_f: tf.Tensor,
       rho_f: tf.Tensor,
+      t_far_field: Optional[tf.Tensor],
   ) -> tf.Tensor:
     """Computes the temperature source term due to reactions.
 
@@ -382,13 +397,27 @@ class Wood(object):
       theta: The fraction of heat of reaction feed into the solid.
       f_f: The reaction rate, in units of 1/s.
       rho_f: The fuel density in a unit volume, in units of kg/m^3.
+      t_far_field: The far-field temperature for the radiation sink, in units of
+        K.
 
     Returns:
       The source term to the gas temperature in conservative form, i.e. rho T.
+
+    Raises:
+      ValueError: If radiation model is activiated in the config but
+        `t_far_field` is not set.
     """
-    q_rad = _radiative_emission(
-        t_g, self.t_ambient, self.s_b,
-        self.efficiency) if self.include_radiation else 0.0
+    if self.include_radiation and t_far_field is None:
+      raise ValueError(
+          'Radiation is included in the combustion model but `t_far_field` is'
+          ' not set.'
+      )
+
+    q_rad = (
+        _radiative_emission(t_g, t_far_field, self.s_b, self.efficiency)
+        if self.include_radiation
+        else 0.0
+    )
     q_conv = _localize_by_fuel(rho_f, self.h_conv * self.a_v * (t_s - t_g))
     q_comb = _localize_by_fuel(rho_f, (1.0 - theta) * f_f * self.h_f)
     return (q_conv + q_comb - q_rad) / self.cp_g
@@ -402,6 +431,7 @@ class Wood(object):
       rho_f: tf.Tensor,
       f_w: Optional[tf.Tensor] = None,
       rho_m: Optional[tf.Tensor] = None,
+      t_far_field: Optional[tf.Tensor] = None,
   ) -> tf.Tensor:
     """Computes the source term for the fuel temperature.
 
@@ -418,13 +448,27 @@ class Wood(object):
       rho_f: The fuel density in a unit volume, in units of kg/m^3.
       f_w: The evaporation rate, in units of kg/m^3/s.
       rho_m: The moisture density in a unit volume, in units of kg/m^3.
+      t_far_field: The far-field temperature for the radiation sink, in units of
+        K.
 
     Returns:
       The source term to the solid temperature.
+
+    Raises:
+      ValueError: If radiation model is activiated in the config but
+        `t_far_field` is not set.
     """
-    q_rad = _radiative_emission(
-        t_s, self.t_ambient, self.s_b,
-        self.efficiency) if self.include_radiation else 0.0
+    if self.include_radiation and t_far_field is None:
+      raise ValueError(
+          'Radiation is included in the combustion model but `t_far_field` is'
+          ' not set.'
+      )
+
+    q_rad = (
+        _radiative_emission(t_s, t_far_field, self.s_b, self.efficiency)
+        if self.include_radiation
+        else 0.0
+    )
     q_conv = _localize_by_fuel(rho_f, self.h_conv * self.a_v * (t_g - t_s))
     q_comb = _localize_by_fuel(
         rho_f, f_f * (theta * self.h_f - _CP_F * self.t_pyr * _N_F))
@@ -434,8 +478,8 @@ class Wood(object):
         self.model_params.WhichOneof('combustion_model_option')
         == 'moist_wood'):
       rhs -= f_w * (
-          self.combustion_model_option.h_w +
-          _CP_W * self.combustion_model_option.t_vap)
+          self.model_params.moist_wood.h_w +
+          _CP_W * self.model_params.moist_wood.t_vap)
 
       cp = _CP_F * _bound_scalar(rho_f, minval=0.0)
 
@@ -486,6 +530,37 @@ class Wood(object):
       raise ValueError('Temperature (`theta` or `T`) needs to be included for '
                        'fire simulations.')
 
+  def _get_far_field_temperature(
+      self,
+      states: FlowFieldMap,
+  ) -> Optional[FlowFieldVal]:
+    """Retrieves the far-field temperature for radiation."""
+    if self.model_params.WhichOneof('t_far_field') == 't_ambient':
+      return tf.constant(self.model_params.t_ambient)
+    elif self.model_params.WhichOneof('t_far_field') == 't_variable':
+      assert self.model_params.t_variable in states, (
+          f'{self.model_params.t_variable} is required to compute the radiation'
+          f' sink, but is missing from the states ({states.keys()}).'
+      )
+      return states[self.model_params.t_variable]
+    else:
+      return None
+
+  def required_additional_states_keys(
+      self, states: types.FlowFieldMap
+  ) -> Sequence[str]:
+    """Provides keys of required additional states for the combustion model."""
+    required_keys = ['rho_f', 'T_s', 'src_rho', 'src_Y_O', 'tke']
+    required_keys.append(self._get_temperature_source_key(states))
+
+    if self.combustion_model_option == 'moist_wood':
+      required_keys += ['rho_m', 'phi_w']
+
+    if self.model_params.WhichOneof('t_far_field') == 't_variable':
+      required_keys += [self.model_params.t_variable]
+
+    return required_keys
+
   def dry_wood_update_fn(
       self,
       rho_f_init: Optional[FlowFieldVal] = None,
@@ -518,42 +593,62 @@ class Wood(object):
         params: grid_parametrization.GridParametrization,
     ) -> FlowFieldMap:
       """Updates 'rho_f', 'T_s', 'src_rho', 'src_T', and 'src_Y_O'."""
+      del kernel_op, replica_id, replicas
+
+      t_far_field = self._get_far_field_temperature(additional_states)
+      combustion_states = dict(states)
+
+      def rhs_t_g_fn(t_s, t_g, theta_val, f_f, rho_f, rho, t_far_field):
+        """Computes the mass-specific source term for gas phase temperature."""
+        return tf.math.divide_no_nan(
+            self._src_t_g(t_s, t_g, theta_val, f_f, rho_f, t_far_field), rho
+        )
 
       def rhs_solid_phase(rho_f, t_s, t_g, y_o):
-        """Computes the right hand side of the equation for `rho_f` and `T_s`."""
+        """Computes the right hand side of equations for `rho_f` and `T_s`."""
         rho_f = _bound_scalar(rho_f, minval=0.0)
         y_o = _bound_scalar(y_o, minval=0.0, maxval=1.0)
 
-        rho, _ = self.thermodynamics_model.update_density(
-            kernel_op, replica_id, replicas, {
-                'Y_O': y_o,
-                'T': t_g,
-                'rho': states['rho'],
-            }, additional_states)
-        f_f = [
-            self.reaction_rate(rho_f_i, rho_i, y_o_i, tke_i, t_s_i)
-            for rho_f_i, rho_i, y_o_i, tke_i, t_s_i in zip(
-                rho_f, rho, y_o, tke, t_s)
-        ]
+        combustion_states.update({'Y_O': y_o, 'T': t_g, 'rho': states['rho']})
+        rho = self.thermodynamics_model.update_thermal_density(
+            combustion_states, additional_states
+        )
+        f_f = tf.nest.map_structure(
+            self.reaction_rate, rho_f, rho, y_o, tke, t_s
+        )
         theta_val = _theta(rho_f, rho_f_init)
 
-        rhs_rho_f = [_src_fuel(f_f_i) for f_f_i in f_f]
-        rhs_t_s = [
-            self._src_t_s(t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i)
-            for t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i in zip(
-                t_s, t_g, theta_val, f_f, rho_f)
-        ]
-        # pylint: disable=g-complex-comprehension
-        rhs_t_g = [
-            tf.math.divide_no_nan(
-                self._src_t_g(t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i), rho_i)
-            for t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i, rho_i in zip(
-                t_s, t_g, theta_val, f_f, rho_f, rho)
-        ]
-        # pylint: enable=g-complex-comprehension
-        rhs_y_o = [
-            _src_oxidizer(f_f_i) / rho_i for f_f_i, rho_i in zip(f_f, rho)
-        ]
+        rhs_rho_f = tf.nest.map_structure(_src_fuel, f_f)
+
+        if self.model_params.WhichOneof('t_far_field') == 't_variable':
+          rhs_t_s = tf.nest.map_structure(
+              self._src_t_s, t_s, t_g, theta_val, f_f, rho_f, t_far_field
+          )
+          rhs_t_g = tf.nest.map_structure(
+              rhs_t_g_fn, t_s, t_g, theta_val, f_f, rho_f, rho, t_far_field
+          )
+        else:
+          rhs_t_s = tf.nest.map_structure(
+              functools.partial(self._src_t_s, t_far_field=t_far_field),
+              t_s,
+              t_g,
+              theta_val,
+              f_f,
+              rho_f,
+          )
+          rhs_t_g = tf.nest.map_structure(
+              functools.partial(rhs_t_g_fn, t_far_field=t_far_field),
+              t_s,
+              t_g,
+              theta_val,
+              f_f,
+              rho_f,
+              rho,
+          )
+
+        rhs_y_o = tf.nest.map_structure(
+            lambda f_f_i, rho_i: _src_oxidizer(f_f_i) / rho_i, f_f, rho
+        )
 
         return (
             rhs_rho_f,
@@ -599,21 +694,39 @@ class Wood(object):
       scalars_new[0] = _bound_scalar(scalars_new[0], minval=0.0)
       rho_f_mid = _compute_mid_state(additional_states['rho_f'], scalars_new[0])
       t_s_mid = _compute_mid_state(additional_states['T_s'], scalars_new[1])
-      f_f_mid = [
-          -(rho_f_new - rho_f_prev) / params.dt / _N_F for rho_f_prev, rho_f_new
-          in zip(additional_states['rho_f'], scalars_new[0])
-      ]
+
+      def f_f_mid_fn(rho_f_prev, rho_f_new):
+        """Computes the rate of fuel consumption at middle of a time step."""
+        return -(rho_f_new - rho_f_prev) / params.dt / _N_F
+
+      f_f_mid = tf.nest.map_structure(
+          f_f_mid_fn, additional_states['rho_f'], scalars_new[0]
+      )
       f_f_mid = _localize_by_fuel(rho_f_mid, f_f_mid)
 
       theta_mid = _theta(rho_f_mid, rho_f_init)
 
-      src_rho = [_N_F * f_f_i for f_f_i in f_f_mid]
-      src_t = [
-          self._src_t_g(t_s_i, t_g_i, theta_i, f_f_i, rho_f_i)
-          for t_s_i, t_g_i, theta_i, f_f_i, rho_f_i in zip(
-              t_s_mid, t_gas, theta_mid, f_f_mid, rho_f_mid)
-      ]
-      src_y_o = [_src_oxidizer(f_f_i) for f_f_i in f_f_mid]
+      src_rho = tf.nest.map_structure(lambda f_f_i: _N_F * f_f_i, f_f_mid)
+      if isinstance(t_far_field, tf.Tensor) or t_far_field is None:
+        src_t = tf.nest.map_structure(
+            functools.partial(self._src_t_g, t_far_field=t_far_field),
+            t_s_mid,
+            t_gas,
+            theta_mid,
+            f_f_mid,
+            rho_f_mid,
+        )
+      else:
+        src_t = tf.nest.map_structure(
+            self._src_t_g,
+            t_s_mid,
+            t_gas,
+            theta_mid,
+            f_f_mid,
+            rho_f_mid,
+            t_far_field,
+        )
+      src_y_o = tf.nest.map_structure(_src_oxidizer, f_f_mid)
 
       src_t_key = self._get_temperature_source_key(states)
       updated_additional_states = dict(additional_states)
@@ -672,9 +785,19 @@ class Wood(object):
         params: grid_parametrization.GridParametrization,
     ) -> FlowFieldMap:
       """Updates wood combustion associated states."""
+      del kernel_op, replica_id, replicas
 
       evaporation = functools.partial(
-          _evaporation, dt=params.dt, c_w=self.combustion_model_option.c_w)
+          _evaporation, dt=params.dt, c_w=self.model_params.moist_wood.c_w)
+
+      t_far_field = self._get_far_field_temperature(additional_states)
+      combustion_states = dict(states)
+
+      def rhs_t_g_fn(t_s, t_g, theta_val, f_f, rho_f, rho, t_far_field):
+        """Compute sthe mass-specific source term for gas phase temperature."""
+        return tf.math.divide_no_nan(
+            self._src_t_g(t_s, t_g, theta_val, f_f, rho_f, t_far_field), rho
+        )
 
       def rhs_solid_phase(rho_f, rho_m, t_s, t_g, y_o, phi_w):
         """Computes the right hand side of the equations in the docstring."""
@@ -682,43 +805,66 @@ class Wood(object):
         rho_m = _bound_scalar(rho_m, minval=0.0)
         y_o = _bound_scalar(y_o, minval=0.0, maxval=1.0)
 
-        rho, _ = self.thermodynamics_model.update_density(
-            kernel_op, replica_id, replicas, {
-                'Y_O': y_o,
-                'T': t_g,
-                'rho': states['rho'],
-            }, additional_states)
-        f_f = [
-            self.reaction_rate(rho_f_i, rho_i, y_o_i, tke_i, t_s_i)
-            for rho_f_i, rho_i, y_o_i, tke_i, t_s_i in zip(
-                rho_f, rho, y_o, tke, t_s)
-        ]
-        f_w = []
-        phi_w_new = []
-        for t_s_i, phi_w_i, rho_m_i in zip(t_s, phi_w, rho_m):
-          f_w_i, phi_w_new_i = evaporation(t_s_i, phi_w_i, rho_m_i)
-          f_w.append(f_w_i)
-          phi_w_new.append(phi_w_new_i)
+        combustion_states.update({'Y_O': y_o, 'T': t_g, 'rho': states['rho']})
+        rho = self.thermodynamics_model.update_thermal_density(
+            combustion_states, additional_states
+        )
+        f_f = tf.nest.map_structure(
+            self.reaction_rate, rho_f, rho, y_o, tke, t_s
+        )
+        evap_buf = tf.nest.map_structure(evaporation, t_s, phi_w, rho_m)
+        if isinstance(t_s, Sequence):
+          f_w, phi_w_new = map(list, zip(*evap_buf))
+        else:
+          f_w, phi_w_new = evap_buf
 
         theta_val = _theta(rho_f, rho_f_init)
 
-        rhs_rho_f = [_src_fuel(f_f_i) for f_f_i in f_f]
-        rhs_rho_m = [-f_w_i for f_w_i in f_w]
-        rhs_t_s = [
-            self._src_t_s(t_s_i, t_g_i, theta_i, f_f_i, rho_f_i, f_w_i, rho_m_i)
-            for t_s_i, t_g_i, theta_i, f_f_i, rho_f_i, f_w_i, rho_m_i in zip(
-                t_s, t_g, theta_val, f_f, rho_f, f_w, rho_m)
-        ]
-        rhs_t_g = [
-            self._src_t_g(t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i) / rho_i
-            for t_s_i, t_g_i, theta_val_i, f_f_i, rho_f_i, rho_i in zip(
-                t_s, t_g, theta_val, f_f, rho_f, rho)
-        ]
-        rhs_y_o = [
-            _src_oxidizer(f_f_i) / rho_i for f_f_i, rho_i in zip(f_f, rho)
-        ]
-        rhs_phi_w = [(phi_w_new_i - phi_w_i) / params.dt
-                     for phi_w_new_i, phi_w_i in zip(phi_w_new, phi_w)]
+        rhs_rho_f = tf.nest.map_structure(_src_fuel, f_f)
+        rhs_rho_m = tf.nest.map_structure(tf.math.negative, f_w)
+        if self.model_params.WhichOneof('t_far_field') == 't_variable':
+          rhs_t_s = tf.nest.map_structure(
+              self._src_t_s,
+              t_s,
+              t_g,
+              theta_val,
+              f_f,
+              rho_f,
+              f_w,
+              rho_m,
+              t_far_field,
+          )
+          rhs_t_g = tf.nest.map_structure(
+              rhs_t_g_fn, t_s, t_g, theta_val, f_f, rho_f, rho, t_far_field
+          )
+        else:
+          rhs_t_s = tf.nest.map_structure(
+              functools.partial(self._src_t_s, t_far_field=t_far_field),
+              t_s,
+              t_g,
+              theta_val,
+              f_f,
+              rho_f,
+              f_w,
+              rho_m,
+          )
+          rhs_t_g = tf.nest.map_structure(
+              functools.partial(rhs_t_g_fn, t_far_field=t_far_field),
+              t_s,
+              t_g,
+              theta_val,
+              f_f,
+              rho_f,
+              rho,
+          )
+        rhs_y_o = tf.nest.map_structure(
+            lambda f_f_i, rho_i: _src_oxidizer(f_f_i) / rho_i, f_f, rho
+        )
+        rhs_phi_w = tf.nest.map_structure(
+            lambda phi_w_new_i, phi_w_i: (phi_w_new_i - phi_w_i) / params.dt,
+            phi_w_new,
+            phi_w,
+        )
 
         return (
             rhs_rho_f,
@@ -769,26 +915,49 @@ class Wood(object):
 
       rho_f_mid = _compute_mid_state(additional_states['rho_f'], scalars_new[0])
       t_s_mid = _compute_mid_state(additional_states['T_s'], scalars_new[2])
-      f_f_mid = [
-          -(rho_f_new - rho_f_prev) / params.dt / _N_F for rho_f_prev, rho_f_new
-          in zip(additional_states['rho_f'], scalars_new[0])
-      ]
+
+      def f_mid_fn(rho_prev, rho_new, coeff):
+        """Computes the rate of consumption at middle of a time step."""
+        return -(rho_new - rho_prev) / params.dt / coeff
+
+      f_f_mid = tf.nest.map_structure(
+          functools.partial(f_mid_fn, coeff=_N_F),
+          additional_states['rho_f'],
+          scalars_new[0],
+      )
       f_f_mid = _localize_by_fuel(rho_f_mid, f_f_mid)
-      f_w_mid = [
-          -(rho_m_new - rho_m_prev) / params.dt for rho_m_prev, rho_m_new in
-          zip(additional_states['rho_m'], scalars_new[1])
-      ]
+      f_w_mid = tf.nest.map_structure(
+          functools.partial(f_mid_fn, coeff=1.0),
+          additional_states['rho_m'],
+          scalars_new[1],
+      )
       f_w_mid = _localize_by_fuel(rho_f_mid, f_w_mid)
 
       theta_mid = _theta(rho_f_mid, rho_f_init)
 
-      src_rho = [_N_F * f_f_i + f_w_i for f_f_i, f_w_i in zip(f_f_mid, f_w_mid)]
-      src_t = [
-          self._src_t_g(t_s, t_g, theta_i, f_f_i,
-                        rho_f_i) for t_s, t_g, theta_i, f_f_i, rho_f_i in zip(
-                            t_s_mid, t_gas, theta_mid, f_f_mid, rho_f_mid)
-      ]
-      src_y_o = [_src_oxidizer(f_f_i) for f_f_i in f_f_mid]
+      src_rho = tf.nest.map_structure(
+          lambda f_f_i, f_w_i: _N_F * f_f_i + f_w_i, f_f_mid, f_w_mid
+      )
+      if isinstance(t_far_field, tf.Tensor) or t_far_field is None:
+        src_t = tf.nest.map_structure(
+            functools.partial(self._src_t_g, t_far_field=t_far_field),
+            t_s_mid,
+            t_gas,
+            theta_mid,
+            f_f_mid,
+            rho_f_mid,
+        )
+      else:
+        src_t = tf.nest.map_structure(
+            self._src_t_g,
+            t_s_mid,
+            t_gas,
+            theta_mid,
+            f_f_mid,
+            rho_f_mid,
+            t_far_field,
+        )
+      src_y_o = tf.nest.map_structure(_src_oxidizer, f_f_mid)
 
       src_t_key = self._get_temperature_source_key(states)
       updated_additional_states = dict(additional_states)

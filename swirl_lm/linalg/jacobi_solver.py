@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -180,20 +180,26 @@ class JacobiSolver(base_poisson_solver.PoissonSolver):
     # Compute the right hand side function for interior points.
     p = halo_update_fn(p)
 
-    p_terms = zip(
+    p_terms = (
         self._kernel_op.apply_kernel_op_x(p, 'kSx'),
         self._kernel_op.apply_kernel_op_y(p, 'kSy'),
         self._kernel_op.apply_kernel_op_z(p, 'kSz', 'kSzsh'),
         rhs)
 
-    p_interior = [(fx / self._factor_x + fy / self._factor_y +
-                   fz / self._factor_z - self._factor_b * fb)
-                  for fx, fy, fz, fb in p_terms]
+    p_interior = tf.nest.map_structure(
+        lambda fx, fy, fz, fb: (  # pylint: disable=g-long-lambda
+            fx / self._factor_x
+            + fy / self._factor_y
+            + fz / self._factor_z
+            - self._factor_b * fb
+        ),
+        *p_terms
+    )
 
-    return [
-        self._omega * p_interior_i + (1.0 - self._omega) * p_i
-        for p_interior_i, p_i in zip(p_interior, p)
-    ]
+    return tf.nest.map_structure(
+        lambda p_interior_i, p_i: (  # pylint: disable=g-long-lambda
+            self._omega * p_interior_i + (1.0 - self._omega) * p_i),
+        p_interior, p)
 
   def _variable_coefficient_poisson_step(
       self,
@@ -271,7 +277,7 @@ class JacobiSolver(base_poisson_solver.PoissonSolver):
     Args:
       replica_id: The ID of the replica.
       replicas: A numpy array that maps a replica's grid coordinate to its
-        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 2.
+        replica_id, e.g. replicas[0, 0, 0] = 0, replicas[0, 0, 1] = 1.
       rhs: A 3D field stored in a list of `tf.Tensor` that represents the right
         hand side tensor `b` in the Poisson equation.
       p0: A 3D field stored in a list of `tf.Tensor` that provides initial guess

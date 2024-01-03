@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import numpy as np
 from swirl_lm.base import parameters_pb2
 from swirl_lm.numerics import calculus
 from swirl_lm.numerics import filters
+from swirl_lm.physics import constants
 from swirl_lm.utility import common_ops
 from swirl_lm.utility import get_kernel_fn
 from swirl_lm.utility import types
@@ -36,8 +37,6 @@ FlowFieldMap = types.FlowFieldMap
 # The originally proposed value for the Smagorinsky constant (dimensionless)
 # with turbulence being isotropic and homogeneous.
 _CS_CLASSICAL = 0.18
-# The gravitational constant, in units of m/s².
-_G = 9.81
 
 
 def _test_filter(value: FlowFieldVal) -> FlowFieldVal:
@@ -104,24 +103,24 @@ def _einsum_ij(
 
 
 def _strain_rate_magnitude(
-    strain_rate: Sequence[Sequence[FlowFieldVal]]) -> FlowFieldVal:
+    strain_rate: Sequence[Sequence[FlowFieldVal]],
+) -> FlowFieldVal:
   """Computes the magnitude of the strain rate tensor."""
-  strain_rate_prod = [
-      tf.zeros_like(s_i) for s_i in strain_rate[0][0]
-  ]
+  strain_rate_prod = tf.nest.map_structure(tf.zeros_like, strain_rate[0][0])
 
   for i in range(len(strain_rate)):
     for j in range(3):
-      strain_rate_prod = [
-          s_l + 2.0 * tf.square(strain_rate_ij)
-          for s_l, strain_rate_ij in zip(strain_rate_prod, strain_rate[i][j])
-      ]
+      strain_rate_prod = tf.nest.map_structure(
+          lambda s_l, strain_rate_ij: s_l + 2.0 * tf.square(strain_rate_ij),
+          strain_rate_prod,
+          strain_rate[i][j],
+      )
 
-  return [tf.math.sqrt(s_l) for s_l in strain_rate_prod]
+  return tf.nest.map_structure(tf.math.sqrt, strain_rate_prod)
 
 
 def _strain_rate_tensor(
-    du_dx: Sequence[Sequence[FlowFieldVal]]
+    du_dx: Sequence[Sequence[FlowFieldVal]],
 ) -> Sequence[Sequence[FlowFieldVal]]:
   """Computes the strain rate tensor based on velocity gradients.
 
@@ -134,21 +133,27 @@ def _strain_rate_tensor(
   Returns:
     The strain rate tensor.
   """
-  sij = [[common_ops.average(du_dx[i][j], du_dx[j][i])
-          for j in range(3)]
-         for i in range(3)]
-  div = [
-      du_11 + du_22 + du_33
-      for du_11, du_22, du_33 in zip(du_dx[0][0], du_dx[1][1], du_dx[2][2])
+  sij = [
+      [common_ops.average(du_dx[i][j], du_dx[j][i]) for j in range(3)]
+      for i in range(3)
   ]
+  div = tf.nest.map_structure(
+      lambda du_11, du_22, du_33: du_11 + du_22 + du_33,
+      du_dx[0][0],
+      du_dx[1][1],
+      du_dx[2][2],
+  )
 
   def remove_divergence(value: FlowFieldVal) -> FlowFieldVal:
     """Remove 1/3 of the divergence from `value`."""
-    return [value_i - div_i / 3.0 for value_i, div_i in zip(value, div)]
+    return tf.nest.map_structure(
+        lambda value_i, div_i: value_i - div_i / 3.0, value, div
+    )
 
-  return [[
-      sij[i][j] if i != j else remove_divergence(sij[i][j]) for j in range(3)
-  ] for i in range(3)]
+  return [
+      [sij[i][j] if i != j else remove_divergence(sij[i][j]) for j in range(3)]
+      for i in range(3)
+  ]
 
 
 def _germano_averaging(
@@ -274,17 +279,22 @@ class SgsModel(object):
       coeff = np.sqrt(self._params.smagorinsky.pr_t) if use_pr_t else 1.0
 
       if additional_states is not None and 'c_s' in additional_states.keys():
-        c_s = [
-            c_s_i / coeff
-            for c_s_i in additional_states['c_s']
-        ]
+        c_s = tf.nest.map_structure(
+            lambda c_s_i: c_s_i / coeff,
+            additional_states['c_s'],
+        )
       else:
-        c_s = [
-            self._params.smagorinsky.c_s / coeff *
-            tf.ones_like(var, dtype=var.dtype) for var in field_vars[0]
-        ]
-      return (self.smagorinsky(velocity, self._delta, c_s)
-              if use_pr_t else self.smagorinsky(field_vars, self._delta, c_s))
+        c_s = tf.nest.map_structure(
+            lambda var: self._params.smagorinsky.c_s  # pylint: disable=g-long-lambda
+            / coeff
+            * tf.ones_like(var),
+            field_vars[0],
+        )
+      diff_t = (
+          self.smagorinsky(velocity, self._delta, c_s)
+          if use_pr_t
+          else self.smagorinsky(field_vars, self._delta, c_s)
+      )
     elif self._params.WhichOneof('sgs_model_type') == 'dynamic_smagorinsky':
       if not velocity:
         raise ValueError('Velocity field is required for the dynamic '
@@ -297,8 +307,9 @@ class SgsModel(object):
           self._params.dynamic_smagorinsky.periodic_y,
           self._params.dynamic_smagorinsky.periodic_z,
       ]
-      return self.dynamic_smagorinsky(self._delta, periodic_dims, replicas,
-                                      velocity, field_vars[0])
+      diff_t = self.dynamic_smagorinsky(
+          self._delta, periodic_dims, replicas, velocity, field_vars[0]
+      )
     elif self._params.WhichOneof('sgs_model_type') == 'smagorinsky_lilly':
       if additional_states is None or 'theta_v' not in additional_states.keys():
         raise ValueError(
@@ -311,17 +322,26 @@ class SgsModel(object):
 
       scalar = velocity if use_pr_t else field_vars
 
-      return self.smagorinsky_lilly(scalar, velocity,
-                                    additional_states['theta_v'], self._delta,
-                                    c_s, self._params.smagorinsky_lilly.pr_t)
+      diff_t = self.smagorinsky_lilly(
+          scalar,
+          velocity,
+          additional_states['theta_v'],
+          self._delta,
+          c_s,
+          self._params.smagorinsky_lilly.pr_t,
+      )
     elif self._params.WhichOneof('sgs_model_type') == 'vreman':
-      return [
+      diff_t = [
           nu_t / self._params.vreman.pr_t for nu_t in self.vreman(
               velocity, self._delta, self._params.vreman.c_s)
       ]
     else:
       raise ValueError('Unsupported sub-grid scale model {}'.format(
           self._params.WhichOneof('sgs_model_type')))
+
+    return tf.nest.map_structure(
+        lambda d: tf.math.maximum(d, self._params.diff_t_min), diff_t
+    )
 
   def turbulent_viscosity(
       self,
@@ -353,11 +373,11 @@ class SgsModel(object):
       if additional_states is not None and 'c_s' in additional_states.keys():
         c_s = additional_states['c_s']
       else:
-        c_s = [
-            self._params.smagorinsky.c_s * tf.ones_like(var, dtype=var.dtype)
-            for var in field_vars[0]
-        ]
-      return self.smagorinsky(field_vars, self._delta, c_s)
+        c_s = tf.nest.map_structure(
+            lambda var: self._params.smagorinsky.c_s * tf.ones_like(var),
+            field_vars[0],
+        )
+      nu_t = self.smagorinsky(field_vars, self._delta, c_s)
     elif self._params.WhichOneof('sgs_model_type') == 'dynamic_smagorinsky':
       if replicas is None:
         raise ValueError('TPU topology replicas needs to be specified for the '
@@ -367,22 +387,26 @@ class SgsModel(object):
           self._params.dynamic_smagorinsky.periodic_y,
           self._params.dynamic_smagorinsky.periodic_z,
       ]
-      return self.dynamic_smagorinsky(self._delta, periodic_dims, replicas,
+      nu_t = self.dynamic_smagorinsky(self._delta, periodic_dims, replicas,
                                       field_vars)
     elif self._params.WhichOneof('sgs_model_type') == 'smagorinsky_lilly':
       if additional_states is None or 'theta_v' not in additional_states.keys():
         raise ValueError(
             '`theta_v` is required in the `additional_states` for the '
             'Smagorinsky-Lilly model.')
-      return self.smagorinsky_lilly(field_vars, field_vars,
+      nu_t = self.smagorinsky_lilly(field_vars, field_vars,
                                     additional_states['theta_v'], self._delta,
                                     self._params.smagorinsky_lilly.c_s,
                                     self._params.smagorinsky_lilly.pr_t)
     elif self._params.WhichOneof('sgs_model_type') == 'vreman':
-      return self.vreman(field_vars, self._delta, self._params.vreman.c_s)
+      nu_t = self.vreman(field_vars, self._delta, self._params.vreman.c_s)
     else:
       raise ValueError('Unsupported sub-grid scale model {}'.format(
           self._params.WhichOneof('sgs_model_type')))
+
+    return tf.nest.map_structure(
+        lambda n: tf.math.maximum(n, self._params.nu_t_min), nu_t
+    )
 
   def smagorinsky(
       self,
@@ -415,11 +439,11 @@ class SgsModel(object):
     Returns:
       The turbulent viscosity.
     """
-    if not c_s_in:
-      c_s = [
-          _CS_CLASSICAL * tf.ones_like(var, dtype=var.dtype)
-          for var in field_vars[0]
-      ]
+    if c_s_in is None:
+      c_s = tf.nest.map_structure(
+          lambda var: _CS_CLASSICAL * tf.ones_like(var),
+          field_vars[0],
+      )
     else:
       c_s = c_s_in
 
@@ -436,12 +460,13 @@ class SgsModel(object):
 
     strain_rate_magnitude = _strain_rate_magnitude(s_ij)
 
-    delta_square = np.sum(np.array(delta)**2)
+    delta_square = np.sum(np.array(delta) ** 2)
 
-    return [
-        c_s_i**2 * delta_square * s_l
-        for c_s_i, s_l in zip(c_s, strain_rate_magnitude)
-    ]
+    return tf.nest.map_structure(
+        lambda c_s_i, s_l: c_s_i**2 * delta_square * s_l,
+        c_s,
+        strain_rate_magnitude,
+    )
 
   def dynamic_smagorinsky(
       self,
@@ -542,7 +567,7 @@ class SgsModel(object):
       # best approach will be rewrite the class to incorporate all needed
       # information of the grid config.
       halo_width = 2
-      m_inner = common_ops.strip_halos(m, (halo_width, halo_width, halo_width))
+      m_inner = common_ops.strip_halos(m, (halo_width, halo_width, halo_width))  # pytype: disable=wrong-arg-types  # always-use-return-annotations
       m_avg_inner = _germano_averaging(m_inner, periodic_dims, replicas)
       z_pad = [
           # These are in the halos and can be set to any values. Although they
@@ -610,23 +635,26 @@ class SgsModel(object):
     def richardson_number():
       """Computes the Richardson number."""
       dt_dz = self._kernel_op.apply_kernel_op_z(temperature, 'kDz', 'kDzsh')
-      buoyancy_freq_square = [
-          _G / t_i * dt_dz_i for t_i, dt_dz_i in zip(temperature, dt_dz)
-      ]
-      return [
-          tf.math.divide_no_nan(n_square, s**2)
-          for n_square, s in zip(buoyancy_freq_square, strain_rate_magnitude)
-      ]
+      buoyancy_freq_square = tf.nest.map_structure(
+          lambda t_i, dt_dz_i: constants.G / t_i * dt_dz_i, temperature, dt_dz
+      )
+      return tf.nest.map_structure(
+          lambda n_square, s: tf.math.divide_no_nan(n_square, s**2),
+          buoyancy_freq_square,
+          strain_rate_magnitude,
+      )
 
     def f_b():
       """Computes the stratification correction coefficient."""
       ri = richardson_number()
-      return [  # pylint: disable=g-complex-comprehension
-          tf.compat.v1.where(
-              tf.less_equal(ri_i, 0.0), tf.ones_like(ri_i, dtype=ri_i.dtype),
-              tf.math.pow(tf.maximum(0.0, 1.0 - ri_i / pr_t), 0.25))
-          for ri_i in ri
-      ]
+      return tf.nest.map_structure(
+          lambda ri_i: tf.compat.v1.where(  # pylint: disable=g-long-lambda
+              tf.less_equal(ri_i, 0.0),
+              tf.ones_like(ri_i),
+              tf.math.pow(tf.maximum(0.0, 1.0 - ri_i / pr_t), 0.25),
+          ),
+          ri,
+      )
 
     nvar = len(field_vars)
 
@@ -645,13 +673,16 @@ class SgsModel(object):
     du_dx = calculus.grad(self._kernel_op, velocity, delta)
     s_ij = _strain_rate_tensor(du_dx)
     strain_rate_magnitude = _strain_rate_magnitude(s_ij)
-
-    delta_updated = [
-        np.power(np.prod(delta), 1.0 / 3.0) * f_b_i for f_b_i in f_b()
-    ]
-
-    return [tf.math.minimum((c_s * delta_l)**2 * s_l, self._params.diff_t_max)
-            for delta_l, s_l in zip(delta_updated, df_magnitude)]
+    delta_updated = tf.nest.map_structure(
+        lambda f_b_i: np.power(np.prod(delta), 1.0 / 3.0) * f_b_i, f_b()
+    )
+    return tf.nest.map_structure(
+        lambda delta_l, s_l: tf.math.minimum(  # pylint: disable=g-long-lambda
+            (c_s * delta_l) ** 2 * s_l, self._params.diff_t_max
+        ),
+        delta_updated,
+        df_magnitude,
+    )
 
   def vreman(
       self,

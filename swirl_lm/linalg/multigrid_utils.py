@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ while TensorFlow-only functions return `tf.Tensor`.
 import functools
 import itertools
 import math
+import re
 from typing import Callable, List, Mapping, Optional, Sequence, Text, Tuple, Union
 
 from absl import logging
@@ -42,8 +43,10 @@ import numpy as np
 import scipy as sp
 import scipy.linalg  # pylint: disable=unused-import
 from swirl_lm.base import initializer
+from swirl_lm.base import parameters as parameters_lib
 from swirl_lm.communication import halo_exchange
 from swirl_lm.communication import halo_exchange_utils
+from swirl_lm.linalg import poisson_solver_pb2
 from swirl_lm.utility import grid_parametrization
 from swirl_lm.utility import types
 import tensorflow as tf
@@ -65,6 +68,8 @@ ThreeIntTuple = Tuple[int, int, int]
 SmootherTypeFn = Callable[[TensorOrArray, TensorOrArray], TensorOrArray]
 InitFn = types.InitFn
 FlowFieldVal = types.FlowFieldVal
+
+HELPER_VARIABLES = ('ps', 'rs')
 
 _NP_DTYPE = types.NP_DTYPE
 
@@ -440,7 +445,7 @@ def poisson_residual_norm(
   return np.linalg.norm(res_no_border)
 
 
-def prolong_matrix(n2: int, n1: Optional[int] = None,
+def prolong_matrix(n2: int, n1: Optional[int] = None,  # pytype: disable=annotation-type-mismatch  # numpy-scalars
                    dtype: np.dtype = _NP_DTYPE) -> np.ndarray:
   """Returns a prolongation matrix (2D numpy array).
 
@@ -495,7 +500,7 @@ def _restrict_matrix_from_prolong(p: np.ndarray) -> np.ndarray:
   return p.T * (n1 - 1) / (n2 - 1)
 
 
-def restrict_matrix(n2: int, n1: Optional[int] = None,
+def restrict_matrix(n2: int, n1: Optional[int] = None,  # pytype: disable=annotation-type-mismatch  # numpy-scalars
                     dtype: np.dtype = _NP_DTYPE) -> np.ndarray:
   """Returns a restriction matrix from `n2` to `n1`. See `prolong_matrix`."""
   return _restrict_matrix_from_prolong(prolong_matrix(n2, n1, dtype))
@@ -521,7 +526,7 @@ def _grid_sizes(n2: int, n1: int) -> List[Tuple[int, int]]:
   return sizes
 
 
-def _prolong_matrices(n2: int, n1: int,
+def _prolong_matrices(n2: int, n1: int,  # pytype: disable=annotation-type-mismatch  # numpy-scalars
                       dtype: np.dtype = _NP_DTYPE) -> List[np.ndarray]:
   """Returns a sequence of prolongation matrices from `n2` to `n1`."""
   return [prolong_matrix(m2, m1, dtype) for m2, m1 in _grid_sizes(n2, n1)]
@@ -661,7 +666,7 @@ def full_1d_grid_size_pairs(
   return sizes
 
 
-def prolong_restrict_matrices_from_params(
+def prolong_restrict_matrices_from_params(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     params: grid_parametrization.GridParametrization,
     coarsest_subgrid_shape: Optional[Sequence[int]] = None,
     dtype: np.dtype = _NP_DTYPE
@@ -699,7 +704,13 @@ def prolong_restrict_matrices_from_params(
                      'greater than or equal to `coarsest_subgrid_shape` '
                      f'({coarsest_subgrid_shape}).')
 
-  full_grid_shape = params.fx, params.fy, params.fz
+  # Currently the multigrid solver always assumes halo width of 1. When used
+  # in case of halo width larger than 1, the solver is still called with an
+  # adaptation step to keep only a single halo layer. So here the
+  # `full_grid_shape` is calculated with a fixed halo width of 1.
+  full_grid_shape = (params.core_nx * params.cx + 2,
+                     params.core_ny * params.cy + 2,
+                     params.core_nz * params.cz + 2)
   computation_shape = params.cx, params.cy, params.cz
 
   return prolong_restrict_matrices_from_shapes(full_grid_shape,
@@ -708,7 +719,7 @@ def prolong_restrict_matrices_from_params(
                                                dtype)
 
 
-def prolong_restrict_matrices_from_shapes(
+def prolong_restrict_matrices_from_shapes(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     full_grid_shape: Sequence[int],
     coarsest_subgrid_shape: Sequence[int],
     computation_shape: Sequence[int],
@@ -786,7 +797,7 @@ def convert_ps_rs_dict_to_tuple(
   return (ps, rs)
 
 
-def get_ps_rs_init_fn(params: grid_parametrization.GridParametrization,
+def get_ps_rs_init_fn(params: grid_parametrization.GridParametrization,  # pytype: disable=annotation-type-mismatch  # numpy-scalars
                       coarsest_subgrid_shape: Optional[Sequence[int]] = None,
                       dtype: np.dtype = _NP_DTYPE):
   """Returns an init function for prolongation and restriction matrices.
@@ -812,7 +823,7 @@ def get_ps_rs_init_fn(params: grid_parametrization.GridParametrization,
   ps_per_level, rs_per_level = prolong_restrict_matrices_from_params(
       params, coarsest_subgrid_shape, dtype)
 
-  get_subgrid_size = lambda s, c: (s - 2) // c + 2
+  get_subgrid_size = lambda s, c: int((s - 2) // c + 2)
 
   def ps_rs_init_fn(coordinates: Union[np.ndarray, Tuple[int, int, int]]):
     ps, rs = {}, {}
@@ -823,13 +834,23 @@ def get_ps_rs_init_fn(params: grid_parametrization.GridParametrization,
         if p is not None:
           key = f'{level}_{dim}'
           subgrid_size = get_subgrid_size(p.shape[0], computation_shape[dim])
-          dim_0_slice = initializer.subgrid_slice(subgrid_size,
-                                                  coordinates[dim])
+          dim_0_start, dim_0_end = initializer.subgrid_slice_indices(
+              subgrid_size, coordinates[dim]
+          )
           subgrid_size = get_subgrid_size(p.shape[1], computation_shape[dim])
-          dim_1_slice = initializer.subgrid_slice(subgrid_size,
-                                                  coordinates[dim])
-          ps[key] = p[dim_0_slice, dim_1_slice]
-          rs[key] = r[dim_1_slice, dim_0_slice]
+          dim_1_start, dim_1_end = initializer.subgrid_slice_indices(
+              subgrid_size, coordinates[dim]
+          )
+          ps[key] = tf.slice(
+              p,
+              [dim_0_start, dim_1_start],
+              [dim_0_end - dim_0_start, dim_1_end - dim_1_start],
+          )
+          rs[key] = tf.slice(
+              r,
+              [dim_1_start, dim_0_start],
+              [dim_1_end - dim_1_start, dim_0_end - dim_0_start],
+          )
 
     return {'ps': ps, 'rs': rs}
 
@@ -869,6 +890,19 @@ def get_full_grids_init_fn(
         full_grid_shape, full_grid_lengths)[0]
   b_minus_a_xb = b - a_operator(xb)
 
+  def subgrid_of_3d_grid(full_3d_grid, coordinates):
+    """Retrieves the subgrid in the partition specified by `coordinates`."""
+    if params.cx * params.cy * params.cz == 1:
+      return full_3d_grid
+
+    # Note that halo_width is assumed to be 1 in the current multigrid solver
+    # implementation.
+    halo_width = 1
+
+    return initializer.subgrid_of_3d_grid(
+        full_3d_grid, (params.nx, params.ny, params.nz), coordinates, halo_width
+    )
+
   def init_fn(replica_id, coordinates):
     dtype = x.dtype.as_numpy_dtype if isinstance(x, tf.Tensor) else x.dtype
     ps_rs_init_fn = get_ps_rs_init_fn(params, coarsest_subgrid_shape, dtype)
@@ -876,12 +910,9 @@ def get_full_grids_init_fn(
     state.update({
         'replica_id': replica_id,
         'coordinates': coordinates,
-        'x0': initializer.subgrid_of_3d_grid_from_params(
-            x0, params, coordinates),
-        'xb': initializer.subgrid_of_3d_grid_from_params(
-            xb, params, coordinates),
-        'b_minus_a_xb': initializer.subgrid_of_3d_grid_from_params(
-            b_minus_a_xb, params, coordinates)
+        'x0': subgrid_of_3d_grid(x0, coordinates),
+        'xb': subgrid_of_3d_grid(xb, coordinates),
+        'b_minus_a_xb': subgrid_of_3d_grid(b_minus_a_xb, coordinates),
     })
 
     return state
@@ -990,7 +1021,7 @@ def kronecker_products(ms: Sequence[Optional[TensorOrArray]],
   return x
 
 
-def laplacian_matrix(
+def laplacian_matrix(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     shape: Sequence[int],
     grid_lengths: Optional[Sequence[float]] = None,
     boundary_conditions: Optional[BoundaryConditionsSpec] = None,
@@ -1090,7 +1121,7 @@ def laplacian_matrix(
   return a
 
 
-def inverse_laplacian_matrix(
+def inverse_laplacian_matrix(  # pytype: disable=annotation-type-mismatch  # numpy-scalars
     shape: Sequence[int],
     grid_lengths: Optional[Sequence[float]] = None,
     boundary_conditions: Optional[BoundaryConditionsSpec] = None,
@@ -1171,3 +1202,173 @@ def halo_exchange_step_fn(
     return tf.stack(tiles, axis=-1) if is_tensor else tiles
 
   return halo_exchange_fn
+
+
+# Helper functions for coupling the multigrid solver with Swirl-LM.
+def flatten_dict_with_prefix(
+    data: Mapping[str, tf.Tensor],
+    prefix: str,
+) -> Mapping[str, tf.Tensor]:
+  """Adds a prefix to all keys in `data`.
+
+  Args:
+    data: A dictionary of `tf.Tensor`.
+    prefix: The prefix to be added in front of each key in `data`.
+
+  Returns:
+    A dictionary that is identical to `data`, but with its keys being
+    `{prefix}-{original_key_in_data}`.
+  """
+  return {f'{prefix}-{key}': val for key, val in data.items()}
+
+
+def remove_prefix_in_dict(
+    data: Mapping[str, tf.Tensor],
+    prefix: str,
+) -> Mapping[str, tf.Tensor]:
+  """Removes prefix from keys in `data`.
+
+  Args:
+    data: A dictionary of tf.Tensor.
+    prefix: The prefix to be removed from keys in `data`.
+
+  Returns:
+    A dictionary that contains all items that starts with `{prefix}-` in data.
+    Matching items with keys specified as `{prefix}-{key}` will be rekeyed as
+    `key`.
+  """
+  res = {}
+  for maybe_prefixed_key, val in data.items():
+    key = re.split(f'{prefix}-', maybe_prefixed_key)
+    if len(key) == 1:
+      continue
+
+    res[key[-1]] = val
+
+  return res
+
+
+def maybe_get_multigrid_params(
+    params: parameters_lib.SwirlLMParameters,
+) -> Optional[poisson_solver_pb2.PoissonSolver.Multigrid]:
+  """Retrieves the parameters for the multigrid solver.
+
+  Args:
+    params: An instance of the `SwirlLMParameters` specifying a simulation
+      configuration.
+
+  Returns:
+    Parameters of the multigrid solver if defined in the simulation config.
+    Otherwise returns `None`.
+  """
+  if (
+      params.pressure is None
+      or params.pressure.solver.WhichOneof('solver') != 'multigrid'
+  ):
+    return None
+
+  return params.pressure.solver.multigrid
+
+
+def get_multigrid_helper_var_keys(
+    params: parameters_lib.SwirlLMParameters,
+) -> List[str]:
+  """Generates a list of helper variable names for the MG solver.
+
+  Args:
+    params: An instance of the `SwirlLMParameters` specifying a simulation
+      configuration.
+
+  Returns:
+    A list of string specifying the names of all helper variables required by
+    the multigrid solver.
+  """
+  mg_params = maybe_get_multigrid_params(params)
+
+  assert mg_params is not None, (
+      '`multigrid` parameters are not defined in the config while the multigrid'
+      ' solver is used.'
+  )
+
+  # Currently the multigrid solver always assumes halo width of 1. When used
+  # in case of halo width larger than 1, the solver is still called with an
+  # adaptation step to keep only a single halo layer. So here the
+  # `full_grid_shape` is calculated with a fixed halo width of 1.
+  full_grid_shape = (
+      params.core_nx * params.cx + 2,
+      params.core_ny * params.cy + 2,
+      params.core_nz * params.cz + 2,
+  )
+  computation_shape = params.cx, params.cy, params.cz
+  coarsest_subgrid_shape = (
+      mg_params.coarsest_subgrid_shape.dim_0,
+      mg_params.coarsest_subgrid_shape.dim_1,
+      mg_params.coarsest_subgrid_shape.dim_2,
+  )
+
+  full_grid_size_pairs_per_level = list(
+      itertools.zip_longest(
+          *[
+              full_1d_grid_size_pairs(fg, c, csgs)
+              for fg, c, csgs in zip(
+                  full_grid_shape, computation_shape, coarsest_subgrid_shape
+              )
+          ]
+      )
+  )
+
+  return list(
+      f'{varname}-{level}_{dim}'  # pylint: disable=g-complex-comprehension
+      for varname, level, dim in itertools.product(
+          HELPER_VARIABLES, range(len(full_grid_size_pairs_per_level)), range(3)
+      )
+      if full_grid_size_pairs_per_level[level][dim] is not None
+  )
+
+
+def get_multigrid_helper_var_init_fn(
+    params: parameters_lib.SwirlLMParameters,
+) -> types.InitFn:
+  """Generates a function that initializes helper variables for the MG solver.
+
+  Args:
+    params: An instance of the `SwirlLMParameters` specifying a simulation
+      configuration.
+
+  Returns:
+    A function that initializes the helper variables, i.e. 'ps' and 'rs', that
+    are required by the multigrid solver. Note that all subfields of `ps` and
+    `rs` are appended with the prefix 'ps' or 'rs', respectively.
+  """
+  mg_params = maybe_get_multigrid_params(params)
+
+  assert mg_params is not None, (
+      '`multigrid` parameters are not defined in the config while the multigrid'
+      ' solver is used.'
+  )
+
+  coarsest_subgrid_shape = (
+      mg_params.coarsest_subgrid_shape.dim_0,
+      mg_params.coarsest_subgrid_shape.dim_1,
+      mg_params.coarsest_subgrid_shape.dim_2,
+  )
+
+  ps_rs_init_fn = get_ps_rs_init_fn(
+      params, coarsest_subgrid_shape=coarsest_subgrid_shape
+  )
+
+  def multigrid_helper_var_init_fn(
+      replica_id: tf.Tensor,
+      coordinates: types.ReplicaCoordinates,
+  ) -> types.FlowFieldMap:
+    """Fits the `ps_rs_init_fn` to the `init_fn` signature."""
+    del replica_id
+    ps_rs = ps_rs_init_fn(coordinates)
+
+    helper_var = {}
+    for prefix, val in ps_rs.items():
+      helper_var.update(flatten_dict_with_prefix(val, prefix))
+
+    return helper_var
+
+  return multigrid_helper_var_init_fn

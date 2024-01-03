@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,6 @@
 # limitations under the License.
 
 """A library that manages `physical_variable_keys` in fluid simulations."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import abc
 import enum
@@ -301,32 +297,3 @@ class SourceKeysHelper(PhysicalVariableKeysHelper):
       'src_[varname]'.
     """
     return 'src_{}'.format(varname)
-
-
-def physical_variable_keys_manager(
-    physical_variables_type: PhysicalVariablesType,
-) -> PhysicalVariableKeysHelper:
-  """Provides the correct key helper for a provided `additional_states` type.
-
-  Args:
-    physical_variables_type: The type of the `additional_states`.
-
-  Returns:
-    The helper object associated with the provided `additional_states` type.
-
-  Raises:
-    ValueError: If the `physical_variables_type` is not currently supported.
-  """
-  if physical_variables_type == PhysicalVariablesType.BOUNDARY_CONDITION:
-    helper = BoundaryConditionKeysHelper()
-  elif physical_variables_type == PhysicalVariablesType.SOURCE:
-    helper = SourceKeysHelper()
-  else:
-    raise ValueError(
-        '{} is not a valid type for additional_state_keys. Available options'
-        'are: {}'.format(physical_variables_type.name, [
-            PhysicalVariablesType.BOUNDARY_CONDITION.name,
-            PhysicalVariablesType.SOURCE.name
-        ]))
-
-  return helper

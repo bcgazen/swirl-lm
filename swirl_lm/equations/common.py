@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,3 +34,8 @@ KEY_RHO_V = 'rho_v'
 KEY_RHO_W = 'rho_w'
 
 KEYS_MOMENTUM = (KEY_RHO_U, KEY_RHO_V, KEY_RHO_W)
+
+# Define keys for buoyancy diagnostics. Note these should be used for
+# diagnostics only.
+# TODO(b/274176115): Clean up all diagnostic variables and move it here.
+KEYS_DIAGNOSTICS_BUOYANCY = ('buoyancy_u', 'buoyancy_v', 'buoyancy_w')

@@ -1,4 +1,4 @@
-# Copyright 2022 The swirl_lm Authors.
+# Copyright 2023 The swirl_lm Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ class ThermodynamicModel(object):
   def rho_ref(
       self,
       zz: Optional[FlowFieldVal] = None,
+      additional_states: Optional[FlowFieldMap] = None,
   ) -> FlowFieldVal:
     """Generates the reference density.
 
@@ -49,16 +50,22 @@ class ThermodynamicModel(object):
     Args:
       zz: The coordinates along the direction of height/gravitation. Useful in
         geophysical flows.
+      additional_states: Helper variables including those needed to compute the
+        reference density.
 
     Returns:
       The reference density in the simulation.
     """
-    del zz
-    return [self._rho * tf.constant(1.0, dtype=TF_DTYPE),] * self._params.nz
+    del zz, additional_states
+    if self._params.use_3d_tf_tensor:
+      return tf.constant(self._rho, dtype=TF_DTYPE)
+    else:
+      return [tf.constant(self._rho, dtype=TF_DTYPE),] * self._params.nz
 
   def p_ref(
       self,
       zz: FlowFieldVal,
+      additional_states: Optional[FlowFieldMap] = None,
   ) -> FlowFieldVal:
     """Generates the reference pressure.
 
@@ -68,10 +75,14 @@ class ThermodynamicModel(object):
     Args:
       zz: The coordinates along the direction of height/gravitation. Useful in
         geophysical flows.
+      additional_states: Helper variables including those needed to compute the
+        reference pressure.
 
     Returns:
       The reference pressure in the simulation.
     """
+    del additional_states
+
     return [
         self._params.p_thermal * tf.ones_like(zz_i, dtype=TF_DTYPE)
         for zz_i in zz
